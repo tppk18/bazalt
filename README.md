@@ -131,13 +131,13 @@ BAZALT_AUTH_PASSWORD=change-this
 # BAZALT_AUTH_ENABLED=false
 ```
 
-Для миграции с 0.1.x backend также принимает старые `PACKMATE_*` ключи, если соответствующий `BAZALT_*` не задан. Docker Compose 0.4.0 передаёт `BAZALT_*` как основные ключи и также пробрасывает legacy `PACKMATE_*`, поэтому существующий `.env` от 0.1.x продолжает работать.
+Для миграции с 0.1.x backend также принимает старые `PACKMATE_*` ключи, если соответствующий `BAZALT_*` не задан. Docker Compose 0.4.1 передаёт `BAZALT_*` как основные ключи и также пробрасывает legacy `PACKMATE_*`, поэтому существующий `.env` от 0.1.x продолжает работать.
 
 PostgreSQL/ClickHouse database namespace пока сохранён как `packmate` для бесшовного обновления существующих volumes. Это внутренний storage namespace, не имя продукта.
 
 ## Диагностика входящего capture
 
-`0.4.0` разделяет метрики source-level и accepted packet-level. По умолчанию `BAZALT_EARLY_PORT_FILTER=false`: libpcap не получает ранний BPF по портам, а обязательный userspace allow-list по настроенным сервисам остаётся активным. Это исключает ситуацию, когда несовместимость BPF/link-layer выглядит как полностью мёртвый capture.
+`0.4.1` разделяет метрики source-level и accepted packet-level. По умолчанию `BAZALT_EARLY_PORT_FILTER=false`: libpcap не получает ранний BPF по портам, а обязательный userspace allow-list по настроенным сервисам остаётся активным. Это исключает ситуацию, когда несовместимость BPF/link-layer выглядит как полностью мёртвый capture.
 
 Ключевые метрики:
 

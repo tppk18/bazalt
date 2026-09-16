@@ -13,7 +13,7 @@ def text(rel: str) -> str:
 
 cargo = tomllib.loads(text("Cargo.toml"))
 assert cargo["package"]["name"] == "bazalt"
-assert cargo["package"]["version"] == "0.4.0"
+assert cargo["package"]["version"] == "0.4.1"
 assert "afxdp" in cargo["features"]["default"]
 assert "serde" in cargo["dependencies"]["bytes"].get("features", []), "bytes::Bytes models require the bytes serde feature"
 
@@ -50,6 +50,8 @@ for m in ("capture_truncated_packets_total", "ip_fragments_reassembled_total",
 
 # Native build/release gate and runtime binary rebrand.
 dockerfile = text("Dockerfile")
+assert "#![deny(warnings)]" in text("src/lib.rs")
+assert "#![deny(warnings)]" in text("src/main.rs")
 assert "cargo test --release --all-features" in dockerfile
 assert "cargo build --release --all-features" in dockerfile
 assert "/target/release/bazalt" in dockerfile
@@ -213,4 +215,4 @@ assert "timers.len() > 4096" in text("src/flow/mod.rs")
 assert "queue_enqueued" in text("src/metrics.rs") and "queue_dequeued" in text("src/metrics.rs")
 assert "DefaultHasher" not in text("src/replay/mod.rs")
 
-print("STATIC PASS: BAZALT 0.4.0 traffic-fidelity, bounded slow paths, auth/management, adaptive CPU and prior safety/UI invariants verified")
+print("STATIC PASS: BAZALT 0.4.1 traffic-fidelity, bounded slow paths, auth/management, adaptive CPU and prior safety/UI invariants verified")

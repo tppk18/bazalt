@@ -1,4 +1,12 @@
-# BAZALT 0.4.0 — traffic-fidelity release
+# BAZALT 0.4.1 — traffic-fidelity release
+
+## 0.4.1 build hygiene
+
+- fixes the stale `MetadataSink` unit-test call site from 0.4.0-r1;
+- removes the two rustc warnings in `capture/parser.rs`;
+- local crates use `#![deny(warnings)]`;
+- local rustc warnings are build-breaking via `#![deny(warnings)]`; `scripts/verify_source.sh` keeps the separate rustfmt/clippy gate when a toolchain is available.
+
 
 ## Fidelity fixes
 

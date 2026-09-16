@@ -1,6 +1,8 @@
-# BAZALT 0.4.0 verification
+# BAZALT 0.4.1 verification
 
 The artifact-generation environment does not provide a local Rust toolchain or Docker daemon. Therefore this release does **not** claim a native Rust compile in that environment.
+
+The local library and binary roots use `#![deny(warnings)]`, so rustc warnings in BAZALT itself fail the native build instead of scrolling past. `scripts/verify_source.sh` additionally runs rustfmt/clippy when a Rust toolchain is available.
 
 The Dockerfile remains the authoritative native gate and executes:
 
@@ -24,7 +26,7 @@ Compose YAML is parsed separately before packaging.
 
 The static verifier checks, among other invariants:
 
-- BAZALT 0.4.0 package/version and Docker compile gate;
+- BAZALT 0.4.1 package/version and Docker compile gate;
 - packet logging disabled by default;
 - bounded queues and direct sharded data-plane topology;
 - AF_XDP RX-queue auto-discovery plus all-or-nothing queue-set fallback;
@@ -62,7 +64,7 @@ Full acceptance on a Linux Docker host:
 
 `smoke.sh` retains the functional regression path: service CRUD, configured-port filtering, open flow without FIN/RST, User-Agent filters, historical replay, HTTP/raw deduplication, raw-hit projection and payload retrieval.
 
-## 0.4.0 compile/capture regression gates
+## 0.4.1 compile/capture regression gates
 
 The HTTP test configuration includes both `early_port_filter` and
 `capture_enqueue_timeout`; this prevents new `Config` fields from breaking the
