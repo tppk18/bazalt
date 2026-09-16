@@ -1,0 +1,46 @@
+[package]
+name = "bazalt"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.85"
+description = "High-throughput A/D CTF traffic capture and retrospective analysis platform"
+license = "MIT"
+
+[features]
+default = ["afxdp"]
+afxdp = []
+
+[dependencies]
+aho-corasick = "1.1"
+ahash = "0.8"
+anyhow = "1"
+arc-swap = "1.7"
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+crc32fast = "1"
+flate2 = "1"
+futures = "0.3"
+hex = "0.4"
+httparse = "1"
+libc = "0.2"
+parking_lot = "0.12"
+pcap = "2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"

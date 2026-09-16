@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en" data-theme="basalt">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>BAZALT</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <nav class="navbar fixed-top">
+    <span class="navbar-brand">BAZALT</span>
+    <span class="navbar-text stats"><span id="spm">0</span> <u title="Completed streams per minute">STREAMS/MIN</u><span class="stat-sep">/</span><span id="pps">0</span> <u title="Average captured packets per completed stream">PKT/STREAM</u></span>
+
+    <div class="dropdown" id="patterns-dropdown">
+      <button class="btn nav-button" id="patterns-toggle">PATTERNS</button>
+      <div class="dropdown-menu patterns-menu" id="patterns-menu">
+        <div class="dropdown-pad"><button class="btn btn-primary btn-sm btn-block" id="add-pattern" title="Add pattern">＋</button></div>
+        <div class="dropdown-divider"></div>
+        <button class="dropdown-item" id="all-patterns"><strong>CLEAR FILTER</strong></button>
+        <div id="patterns-menu-items"></div>
+      </div>
+    </div>
+    <span class="navbar-text selected-pattern" id="selected-pattern"></span>
+
+    <div class="service-tabs" id="service-tabs"></div>
+    <button class="navbar-icon" id="add-service" title="Add service">＋</button>
+    <div class="navbar-spacer"></div>
+    <button class="btn nav-button management-nav" id="open-management" type="button" title="Storage, retention and access management">MANAGE</button>
+    <button class="resource-summary" id="resource-toggle" type="button" aria-expanded="false" aria-controls="resource-panel" title="Resource usage">
+      <span class="resource-health-dot" id="resource-health-dot"></span>
+      <span>CPU <strong id="resource-cpu-compact">--</strong></span>
+      <span>RSS <strong id="resource-rss-compact">--</strong></span>
+      <span class="resource-summary-secondary">PIPE <strong id="resource-queue-compact">--</strong></span>
+      <span class="resource-summary-secondary">DROPS <strong id="resource-drop-compact">--</strong></span>
+    </button>
+    <button class="navbar-icon" id="open-settings" title="Settings">⚙</button>
+  </nav>
+
+  <aside class="resource-panel hidden" id="resource-panel" aria-label="Resource usage details">
+    <div class="resource-panel-head">
+      <div>
+        <strong>RESOURCES</strong>
+        <span class="resource-updated" id="resource-updated">waiting for telemetry</span>
+      </div>
+      <button class="resource-minimize" id="resource-minimize" type="button" title="Minimize resource panel">−</button>
+    </div>
+
+    <div class="resource-primary-grid">
+      <div class="resource-card" id="resource-cpu-card">
+        <div class="resource-card-label">BAZALT CPU UTILIZATION</div>
+        <div class="resource-card-value" id="resource-cpu">--</div>
+        <div class="resource-card-meta" id="resource-cpu-meta">--</div>
+        <div class="resource-bar"><span id="resource-cpu-bar"></span></div>
+      </div>
+      <div class="resource-card" id="resource-memory-card">
+        <div class="resource-card-label">MEMORY LIMIT USAGE (<span id="resource-memory-scope">HOST</span>)</div>
+        <div class="resource-card-value" id="resource-memory">--</div>
+        <div class="resource-card-meta" id="resource-memory-meta">--</div>
+        <div class="resource-bar"><span id="resource-memory-bar"></span></div>
+      </div>
+      <div class="resource-card" id="resource-queue-card">
+        <div class="resource-card-label">BUSIEST PIPELINE QUEUE</div>
+        <div class="resource-card-value" id="resource-pressure">--</div>
+        <div class="resource-card-meta" id="resource-pressure-meta">max queue occupancy</div>
+        <div class="resource-bar"><span id="resource-pressure-bar"></span></div>
+      </div>
+      <div class="resource-card" id="resource-ingress-card">
+        <div class="resource-card-label">PACKET CAPTURE RATE</div>
+        <div class="resource-card-value" id="resource-ingress">--</div>
+        <div class="resource-card-meta" id="resource-ingress-meta">--</div>
+        <div class="resource-bar resource-bar-passive"><span></span></div>
+      </div>
+    </div>
+
+    <div class="resource-section-title">PROCESS AND HOST</div>
+    <div class="resource-kv-grid">
+      <div><span>SYSTEM LOAD (1/5/15)</span><strong id="resource-load">--</strong></div>
+      <div><span>PROCESS THREADS</span><strong id="resource-threads">--</strong></div>
+      <div><span>OPEN FILES (FD)</span><strong id="resource-fds">--</strong></div>
+      <div><span>PROCESS UPTIME</span><strong id="resource-uptime">--</strong></div>
+      <div><span>VIRTUAL MEMORY</span><strong id="resource-vmem">--</strong></div>
+      <div><span>WORKER POOLS</span><strong id="resource-workers">--</strong></div>
+    </div>
+
+    <div class="resource-section-title">PIPELINE QUEUES</div>
+    <div class="resource-queue-list" id="resource-queues"></div>
+
+    <div class="resource-section-title">CAPTURE HEALTH / PACKET CLASSIFICATION</div>
+    <div class="resource-loss-grid" id="resource-loss"></div>
+  </aside>
+
+  <section class="management-view hidden" id="management-view">
+    <div class="management-head">
+      <div>
+        <h2>MANAGEMENT</h2>
+        <p>Storage usage, retention and access control status.</p>
+      </div>
+      <div class="management-actions">
+        <button class="btn btn-secondary btn-sm" id="management-refresh" type="button">REFRESH</button>
+        <button class="btn btn-secondary btn-sm" id="management-close" type="button">BACK</button>
+      </div>
+    </div>
+
+    <div class="management-grid">
+      <div class="management-card">
+        <span class="management-card-label">TOTAL MANAGED STORAGE</span>
+        <strong id="mgmt-total-bytes">--</strong>
+        <small>ClickHouse + PostgreSQL + payload segments</small>
+      </div>
+      <div class="management-card">
+        <span class="management-card-label">PAYLOAD SEGMENTS</span>
+        <strong id="mgmt-segment-bytes">--</strong>
+        <small id="mgmt-segment-files">-- files</small>
+      </div>
+      <div class="management-card">
+        <span class="management-card-label">CLICKHOUSE METADATA</span>
+        <strong id="mgmt-clickhouse-bytes">--</strong>
+        <small id="mgmt-clickhouse-rows">-- rows</small>
+      </div>
+      <div class="management-card">
+        <span class="management-card-label">POSTGRESQL CONFIG</span>
+        <strong id="mgmt-postgres-bytes">--</strong>
+        <small>services, patterns, replay jobs, favorites</small>
+      </div>
+    </div>
+
+    <div class="management-section">
+      <div class="management-section-head">
+        <div><h3>CLICKHOUSE TABLES</h3><p>On-disk active parts and approximate average bytes per stored row.</p></div>
+      </div>
+      <div class="management-table-wrap">
+        <table class="management-table">
+          <thead><tr><th>TABLE</th><th>ROWS</th><th>DISK SIZE</th><th>AVG / ROW</th><th>ACTIVE PARTS</th></tr></thead>
+          <tbody id="mgmt-table-body"><tr><td colspan="5">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="management-section retention-section">
+      <div class="management-section-head">
+        <div><h3>RETENTION CLEANUP</h3><p>Delete traffic older than the selected age. Configuration and patterns are preserved.</p></div>
+      </div>
+      <form id="retention-form" class="retention-form">
+        <label>DELETE TRAFFIC OLDER THAN</label>
+        <div class="retention-age">
+          <input id="retention-value" type="number" min="1" value="24" required>
+          <select id="retention-unit">
+            <option value="60">minutes</option>
+            <option value="3600" selected>hours</option>
+            <option value="86400">days</option>
+          </select>
+        </div>
+        <div class="retention-preview" id="retention-preview">Cutoff: --</div>
+        <label class="retention-confirm-label">TYPE <strong>DELETE</strong> TO CONFIRM</label>
+        <input id="retention-confirm" autocomplete="off" placeholder="DELETE">
+        <button class="btn btn-danger" id="retention-submit" type="submit" disabled>DELETE OLD TRAFFIC</button>
+        <p class="management-note">Cleanup seals the current payload segment, drains pending metadata, waits for ClickHouse mutations, then removes payload files that contain only expired records. Mixed-age segments are retained.</p>
+      </form>
+      <div class="management-result hidden" id="retention-result"></div>
+    </div>
+
+    <div class="management-section">
+      <div class="management-section-head">
+        <div><h3>ACCESS CONTROL</h3><p id="mgmt-auth-status">--</p></div>
+        <button class="btn btn-secondary btn-sm" id="logout-btn" type="button">LOG OUT</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-tools">
+        <button id="pause-btn" class="btn btn-sm btn-outline-success" title="Pause new streams">Ⅱ</button>
+        <button id="favorites-btn" class="btn btn-sm btn-outline-danger" title="Favorites">★</button>
+        <button id="hexdump-btn" class="btn btn-sm btn-outline-primary" title="HEX view">HEX</button>
+        <button id="ua-filter-btn" class="btn btn-sm btn-outline-secondary" title="User-Agent filter">UA</button>
+        <button id="scroll-top-btn" class="btn btn-sm btn-outline-info float-right" title="Top">↑</button>
+      </div>
+      <div class="sidebar-sticky">
+        <ul class="stream-list" id="stream-list"></ul>
+        <button class="btn btn-light load-more" id="load-more">MORE</button>
+      </div>
+    </aside>
+
+    <main class="content-pane" id="content-pane">
+      <div class="content-empty" id="empty-content"></div>
+      <section id="stream-content" class="hidden">
+        <div class="stream-heading" id="stream-heading"></div>
+        <div id="packet-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="service-modal">
+    <div class="modal modal-lg">
+      <div class="modal-header"><h5 id="service-modal-title">SERVICE</h5><button class="modal-close" data-close="service-modal">×</button></div>
+      <form id="service-form">
+        <div class="modal-body">
+          <div class="form-row"><label for="service-name">NAME</label><input id="service-name" name="name" required></div>
+          <div class="form-row" id="service-port-row"><label for="service-port">PORT</label><input id="service-port" name="port" type="number" min="1" max="65535" required></div>
+          <div class="form-row"><label for="service-is-http">HTTP</label><input id="service-is-http" name="http" type="checkbox"></div>
+          <div class="form-row"><label for="service-urldecode">URLDECODE</label><input id="service-urldecode" name="urldecode_http_requests" type="checkbox"></div>
+          <div class="form-row"><label for="service-merge">MERGE ADJACENT</label><input id="service-merge" name="merge_adjacent_packets" type="checkbox"></div>
+          <div class="form-row"><label for="service-ws">WEBSOCKET</label><input id="service-ws" name="parse_websockets" type="checkbox"></div>
+          <button type="button" class="btn btn-danger hidden" id="delete-service">DELETE</button>
+        </div>
+        <div class="modal-footer"><button type="button" class="btn btn-secondary" data-close="service-modal">CANCEL</button><button type="submit" class="btn btn-primary">SAVE</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="pattern-modal">
+    <div class="modal">
+      <div class="modal-header"><h5 id="pattern-modal-title">PATTERN</h5><button class="modal-close" data-close="pattern-modal">×</button></div>
+      <form id="pattern-form">
+        <div class="modal-body">
+          <div class="form-row"><label for="pattern-name">NAME</label><input id="pattern-name" name="name" required></div>
+          <div class="form-row create-only"><label for="pattern-value">PATTERN</label><input id="pattern-value" name="expression" required></div>
+          <div class="form-row create-only"><label for="pattern-action">ACTION</label><select id="pattern-action" name="action"><option value="find">FIND</option><option value="ignore">IGNORE</option></select></div>
+          <div class="form-row" id="pattern-color-row"><label for="pattern-color">COLOR</label><input id="pattern-color" name="color" type="color" value="#ff7474"></div>
+          <div class="form-row create-only"><label for="pattern-kind">METHOD</label><select id="pattern-kind" name="kind"><option value="regex">REGEX</option><option value="text" selected>SUBSTRING</option><option value="binary">BYTES</option></select></div>
+          <div class="form-row create-only"><label for="pattern-direction">SIDE</label><select id="pattern-direction" name="direction_type"><option value="input">REQUEST</option><option value="output">RESPONSE</option><option value="both" selected>ANYWHERE</option></select></div>
+          <div class="form-row create-only"><label for="pattern-service">SERVICE</label><select id="pattern-service" name="service"><option value="">ANY</option></select></div>
+        </div>
+        <div class="modal-footer"><button type="button" class="btn btn-secondary" data-close="pattern-modal">CANCEL</button><button type="submit" class="btn btn-primary">SAVE</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="settings-modal">
+    <div class="modal">
+      <div class="modal-header"><h5>SETTINGS</h5><button class="modal-close" data-close="settings-modal">×</button></div>
+      <form id="settings-form">
+        <div class="modal-body">
+          <div class="form-row"><label>HEX WIDTH</label><input type="number" name="hex_block" min="4" max="64"></div>
+          <div class="form-row"><label>LINE BASE</label><select name="line_base"><option value="10">DEC</option><option value="16">HEX</option></select></div>
+          <div class="form-row"><label>PAGE SIZE</label><input type="number" name="page_size" min="10" max="500"></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-primary">SAVE</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="ua-modal">
+    <div class="modal">
+      <div class="modal-header"><h5>USER-AGENT</h5><button class="modal-close" data-close="ua-modal">×</button></div>
+      <form id="ua-form">
+        <div class="modal-body">
+          <div class="form-row"><label>MODE</label><select name="mode"><option value="contains">CONTAINS</option><option value="equals">EQUALS</option><option value="not_contains">NOT CONTAINS</option><option value="regex">REGEX</option></select></div>
+          <div class="form-row"><label>VALUE</label><input name="value" placeholder="python-requests"></div>
+        </div>
+        <div class="modal-footer"><button type="button" class="btn btn-light" id="clear-ua">CLEAR</button><button type="submit" class="btn btn-primary">APPLY</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="login-screen hidden" id="login-screen">
+    <form class="login-card" id="login-form">
+      <div class="login-brand">BAZALT</div>
+      <h1>ACCESS REQUIRED</h1>
+      <p>Authenticate to open the control plane.</p>
+      <label for="login-username">LOGIN</label>
+      <input id="login-username" name="username" autocomplete="username" required autofocus>
+      <label for="login-password">PASSWORD</label>
+      <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      <button class="btn btn-primary" id="login-submit" type="submit">SIGN IN</button>
+      <div class="login-error hidden" id="login-error"></div>
+    </form>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+/target
+/data
+/segments
+.env
+*.pcap
+*.pcapng

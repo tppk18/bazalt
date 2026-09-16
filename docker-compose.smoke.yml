@@ -1,0 +1,12 @@
+services:
+  app:
+    environment:
+      BAZALT_CAPTURE_MODE: pcap-file
+      BAZALT_PCAP_FILE: /pcaps/http_fixture.pcap
+      BAZALT_FLOW_SHARDS: 2
+      BAZALT_REPLAY_WORKERS: 2
+      BAZALT_TCP_IDLE_SECS: 30
+      BAZALT_PACKET_LOGGING: "false"
+      BAZALT_RAW_CAPTURE: "false"
+      BAZALT_AUTH_ENABLED: "false"
+      RUST_LOG: info
