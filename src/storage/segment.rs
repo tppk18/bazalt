@@ -549,14 +549,15 @@ mod tests {
     fn store_writes_index_and_reads_by_location() {
         let dir = tempdir().unwrap();
         let m = Metrics::shared();
-        let (meta_tx, meta_rx) = crossbeam_channel::bounded(8);
-        let store = SegmentStore::open(dir.path().to_path_buf(), 1024 * 1024, m, meta_tx).unwrap();
+        let (command_tx, command_rx) = crossbeam_channel::bounded(8);
+        let metadata_tx = crate::storage::MetadataSink { tx: command_tx };
+        let store = SegmentStore::open(dir.path().to_path_buf(), 1024 * 1024, m, metadata_tx).unwrap();
         let r = ContentRecord { id: Uuid::new_v4(), flow_id: Uuid::new_v4(), ts_ns: 1, service: None, direction: Direction::AToB, view: ContentView::TcpRaw, stream_offset: 0, data: bytes::Bytes::from_static(b"payload") };
         let id = r.id;
         store.append(r).unwrap();
-        let index = match meta_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
-            MetadataEvent::ContentIndex(v) => v,
-            _ => panic!("unexpected event"),
+        let index = match command_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+            crate::storage::MetadataCommand::Event(MetadataEvent::ContentIndex(v)) => v,
+            other => panic!("unexpected metadata command: {other:?}"),
         };
         assert_eq!(index.content_id, id);
         let got = store.read_at(Path::new(&index.segment_path), index.segment_offset).unwrap();

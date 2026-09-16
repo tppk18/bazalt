@@ -6,7 +6,7 @@ use bytes::Bytes;
 use crate::{
     config::Config,
     metrics::Metrics,
-    model::{Direction, FlowKey, ParsedPacket, TcpFlags, TransportProtocol},
+    model::{FlowKey, ParsedPacket, TcpFlags, TransportProtocol},
 };
 
 use super::{fragment::{FragmentInsert, FragmentKey, SharedFragmentCache}, CapturedFrame};
@@ -252,7 +252,7 @@ impl PacketDecoder {
                     }
                     let frag_next = packet[offset];
                     let frag = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
-                    let fragment_offset = ((frag & 0xfff8) as usize);
+                    let fragment_offset = (frag & 0xfff8) as usize;
                     let more = frag & 1 != 0;
                     let id = u32::from_be_bytes([
                         packet[offset + 4], packet[offset + 5], packet[offset + 6], packet[offset + 7],
