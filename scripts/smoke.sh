@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 PROJECT="${COMPOSE_PROJECT_NAME:-bazalt-smoke}"
+# Production compose deliberately has no known database passwords. The smoke
+# stack is loopback-only and ephemeral, so provide test-only credentials unless
+# the caller supplied explicit values.
+export BAZALT_POSTGRES_PASSWORD="${BAZALT_POSTGRES_PASSWORD:-bazalt-smoke-postgres}"
+export BAZALT_CLICKHOUSE_PASSWORD="${BAZALT_CLICKHOUSE_PASSWORD:-bazalt-smoke-clickhouse}"
 COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.smoke.yml)
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
@@ -23,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-rm -rf data/segments/* data/raw/*
+rm -rf data/segments/* data/raw/* data/metadata-spool/*
 python3 scripts/generate_fixture.py
 "${COMPOSE[@]}" up --build -d
 

@@ -44,6 +44,6 @@ ENV BAZALT_LISTEN=0.0.0.0:65000 \
 
 EXPOSE 65000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
-    CMD curl -fsS http://127.0.0.1:65000/api/status >/dev/null || exit 1
+    CMD-SHELL curl -fsS -u "$BAZALT_AUTH_USERNAME:$BAZALT_AUTH_PASSWORD" http://127.0.0.1:65000/api/health >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/bin/bazalt"]

@@ -7,9 +7,9 @@ use std::{
 };
 
 use ahash::AHashMap;
-use std::collections::hash_map::RandomState;
-use parking_lot::Mutex;
 use bytes::Bytes;
+use parking_lot::Mutex;
+use std::collections::hash_map::RandomState;
 
 const FRAGMENT_SHARDS: usize = 64;
 // Cache accounting includes conservative metadata charges so tiny-fragment
@@ -36,7 +36,10 @@ impl SharedFragmentCache {
         let shards = (0..FRAGMENT_SHARDS)
             .map(|_| Mutex::new(FragmentCache::new(per_bytes, per_datagrams, timeout)))
             .collect();
-        Self { shards: Arc::new(shards), shard_hash: RandomState::new() }
+        Self {
+            shards: Arc::new(shards),
+            shard_hash: RandomState::new(),
+        }
     }
 
     pub fn insert(
@@ -50,7 +53,9 @@ impl SharedFragmentCache {
         let mut hasher = self.shard_hash.build_hasher();
         key.hash(&mut hasher);
         let idx = (hasher.finish() as usize) & (FRAGMENT_SHARDS - 1);
-        self.shards[idx].lock().insert(key, offset, more, payload, wire_len)
+        self.shards[idx]
+            .lock()
+            .insert(key, offset, more, payload, wire_len)
     }
 }
 
@@ -155,7 +160,10 @@ impl FragmentCache {
         }
 
         #[derive(Clone, Copy)]
-        enum Reject { Invalid, Overlap }
+        enum Reject {
+            Invalid,
+            Overlap,
+        }
         let mut reject = None::<Reject>;
         let mut duplicate = false;
         let mut added_len = 0usize;
@@ -173,9 +181,12 @@ impl FragmentCache {
                 }
                 // A final fragment cannot retroactively place already-seen
                 // bytes beyond the datagram boundary it declares.
-                if reject.is_none() && state.pieces.iter().any(|(&start, piece)| {
-                    start.saturating_add(piece.data.len()) > end
-                }) {
+                if reject.is_none()
+                    && state
+                        .pieces
+                        .iter()
+                        .any(|(&start, piece)| start.saturating_add(piece.data.len()) > end)
+                {
                     reject = Some(Reject::Invalid);
                 }
             }
@@ -222,16 +233,25 @@ impl FragmentCache {
                 added_len = compact.len().saturating_add(FRAGMENT_PIECE_OVERHEAD);
                 state.bytes = state.bytes.saturating_add(added_len);
                 state.wire_bytes = state.wire_bytes.saturating_add(wire_len);
-                state.pieces.insert(offset, FragmentPiece { data: compact, more });
+                state.pieces.insert(
+                    offset,
+                    FragmentPiece {
+                        data: compact,
+                        more,
+                    },
+                );
             }
         }
 
         if let Some(reason) = reject {
             self.remove_key(&key);
-            return (match reason {
-                Reject::Invalid => FragmentInsert::DroppedInvalid,
-                Reject::Overlap => FragmentInsert::DroppedOverlap,
-            }, maintenance);
+            return (
+                match reason {
+                    Reject::Invalid => FragmentInsert::DroppedInvalid,
+                    Reject::Overlap => FragmentInsert::DroppedOverlap,
+                },
+                maintenance,
+            );
         }
         if duplicate {
             return (self.try_complete(&key), maintenance);
@@ -244,21 +264,31 @@ impl FragmentCache {
         }
 
         while self.bytes > self.max_bytes || self.states.len() > self.max_datagrams {
-            if !self.evict_oldest() { break; }
+            if !self.evict_oldest() {
+                break;
+            }
             maintenance.evicted = maintenance.evicted.saturating_add(1);
         }
         (FragmentInsert::Pending, maintenance)
     }
 
     fn try_complete(&mut self, key: &FragmentKey) -> FragmentInsert {
-        let Some(state) = self.states.get(key) else { return FragmentInsert::Pending; };
-        let Some(total) = state.total_len else { return FragmentInsert::Pending; };
+        let Some(state) = self.states.get(key) else {
+            return FragmentInsert::Pending;
+        };
+        let Some(total) = state.total_len else {
+            return FragmentInsert::Pending;
+        };
         let mut cursor = 0usize;
         for (&start, piece) in &state.pieces {
-            if start != cursor { return FragmentInsert::Pending; }
+            if start != cursor {
+                return FragmentInsert::Pending;
+            }
             cursor = cursor.saturating_add(piece.data.len());
         }
-        if cursor != total { return FragmentInsert::Pending; }
+        if cursor != total {
+            return FragmentInsert::Pending;
+        }
 
         let state = self.states.remove(key).expect("state exists");
         self.bytes = self.bytes.saturating_sub(state.bytes);
@@ -266,7 +296,10 @@ impl FragmentCache {
         for (_, piece) in state.pieces {
             out.extend_from_slice(&piece.data);
         }
-        FragmentInsert::Complete { payload: Bytes::from(out), wire_bytes: state.wire_bytes }
+        FragmentInsert::Complete {
+            payload: Bytes::from(out),
+            wire_bytes: state.wire_bytes,
+        }
     }
 
     fn maintenance(&mut self, now: Instant) -> FragmentMaintenance {
@@ -275,16 +308,28 @@ impl FragmentCache {
         }
         self.last_cleanup = now;
         let timeout = self.timeout;
-        let expired = self.states.iter()
+        let expired = self
+            .states
+            .iter()
             .filter_map(|(k, v)| (now.duration_since(v.last_seen) >= timeout).then_some(k.clone()))
             .collect::<Vec<_>>();
         let count = expired.len() as u64;
-        for key in expired { self.remove_key(&key); }
-        FragmentMaintenance { expired: count, evicted: 0 }
+        for key in expired {
+            self.remove_key(&key);
+        }
+        FragmentMaintenance {
+            expired: count,
+            evicted: 0,
+        }
     }
 
     fn evict_oldest(&mut self) -> bool {
-        let Some(key) = self.states.iter().min_by_key(|(_, v)| v.last_seen).map(|(k, _)| k.clone()) else {
+        let Some(key) = self
+            .states
+            .iter()
+            .min_by_key(|(_, v)| v.last_seen)
+            .map(|(k, _)| k.clone())
+        else {
             return false;
         };
         self.remove_key(&key);
@@ -307,8 +352,8 @@ mod tests {
         FragmentKey {
             version: 4,
             l2_domain: 0,
-            src: IpAddr::V4(Ipv4Addr::new(10,0,0,1)),
-            dst: IpAddr::V4(Ipv4Addr::new(10,0,0,2)),
+            src: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             id: 7,
             next_header: 6,
         }
@@ -316,19 +361,21 @@ mod tests {
 
     #[test]
     fn reassembles_non_overlapping_fragments() {
-        let mut c = FragmentCache::new(1<<20, 16, Duration::from_secs(30));
+        let mut c = FragmentCache::new(1 << 20, 16, Duration::from_secs(30));
         let (a, _) = c.insert(key(), 8, false, Bytes::from_static(b"ijklmnop"), 28);
         assert!(matches!(a, FragmentInsert::Pending));
         let (b, _) = c.insert(key(), 0, true, Bytes::from_static(b"abcdefgh"), 28);
         match b {
-            FragmentInsert::Complete { payload, .. } => assert_eq!(payload.as_ref(), b"abcdefghijklmnop"),
+            FragmentInsert::Complete { payload, .. } => {
+                assert_eq!(payload.as_ref(), b"abcdefghijklmnop")
+            }
             _ => panic!("not complete"),
         }
     }
 
     #[test]
     fn late_final_fragment_cannot_shrink_below_existing_bytes() {
-        let mut c = FragmentCache::new(1<<20, 16, Duration::from_secs(30));
+        let mut c = FragmentCache::new(1 << 20, 16, Duration::from_secs(30));
         let _ = c.insert(key(), 16, true, Bytes::from_static(b"ijklmnop"), 28);
         let (r, _) = c.insert(key(), 0, false, Bytes::from_static(b"abcdefgh"), 28);
         assert!(matches!(r, FragmentInsert::DroppedInvalid));
@@ -336,7 +383,7 @@ mod tests {
 
     #[test]
     fn same_payload_with_conflicting_more_flag_is_not_an_exact_duplicate() {
-        let mut c = FragmentCache::new(1<<20, 16, Duration::from_secs(30));
+        let mut c = FragmentCache::new(1 << 20, 16, Duration::from_secs(30));
         let _ = c.insert(key(), 0, true, Bytes::from_static(b"abcdefgh"), 28);
         let (r, _) = c.insert(key(), 0, false, Bytes::from_static(b"abcdefgh"), 28);
         assert!(matches!(r, FragmentInsert::DroppedOverlap));
@@ -344,7 +391,7 @@ mod tests {
 
     #[test]
     fn empty_final_fragment_can_close_an_existing_range() {
-        let mut c = FragmentCache::new(1<<20, 16, Duration::from_secs(30));
+        let mut c = FragmentCache::new(1 << 20, 16, Duration::from_secs(30));
         let _ = c.insert(key(), 0, true, Bytes::from_static(b"abcdefgh"), 28);
         let (r, _) = c.insert(key(), 8, false, Bytes::new(), 20);
         match r {
@@ -355,7 +402,7 @@ mod tests {
 
     #[test]
     fn rejects_partial_overlap() {
-        let mut c = FragmentCache::new(1<<20, 16, Duration::from_secs(30));
+        let mut c = FragmentCache::new(1 << 20, 16, Duration::from_secs(30));
         let _ = c.insert(key(), 0, true, Bytes::from_static(b"abcdefgh"), 28);
         let (b, _) = c.insert(key(), 4, false, Bytes::from_static(b"XXXXXXXX"), 28);
         assert!(matches!(b, FragmentInsert::DroppedOverlap));

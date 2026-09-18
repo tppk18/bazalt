@@ -4,9 +4,11 @@ services:
     environment:
       POSTGRES_DB: packmate
       POSTGRES_USER: packmate
-      POSTGRES_PASSWORD: packmate
+      POSTGRES_PASSWORD: ${BAZALT_POSTGRES_PASSWORD:?set BAZALT_POSTGRES_PASSWORD in .env}
     ports:
-      - "65001:5432"
+      # The app uses host networking and reaches PostgreSQL via loopback.
+      # Never expose the database directly on hostile/game interfaces.
+      - "127.0.0.1:65001:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -19,14 +21,18 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
     environment:
+      CLICKHOUSE_DB: packmate
+      CLICKHOUSE_USER: bazalt
+      CLICKHOUSE_PASSWORD: ${BAZALT_CLICKHOUSE_PASSWORD:?set BAZALT_CLICKHOUSE_PASSWORD in .env}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
-      - "65002:8123"
-      - "65003:9000"
+      # Only the HTTP interface is used by BAZALT. Keep it host-local and do
+      # not publish the native ClickHouse protocol at all.
+      - "127.0.0.1:65002:8123"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null"]
+      test: ["CMD-SHELL", "clickhouse-client --user bazalt --password $$CLICKHOUSE_PASSWORD --query 'SELECT 1' >/dev/null"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -44,6 +50,7 @@ services:
         hard: -1
     volumes:
       - ./data/segments:/data/segments
+      - ./data/metadata-spool:/data/metadata-spool
       - ./data/raw:/data/raw
       - ./pcaps:/pcaps:ro
       - /sys/fs/bpf:/sys/fs/bpf
@@ -89,6 +96,9 @@ services:
       PACKMATE_MATCH_QUEUE: ${PACKMATE_MATCH_QUEUE:-}
       BAZALT_STORAGE_QUEUE: ${BAZALT_STORAGE_QUEUE:-}
       PACKMATE_STORAGE_QUEUE: ${PACKMATE_STORAGE_QUEUE:-}
+      BAZALT_METADATA_SPOOL_DIR: /data/metadata-spool
+      BAZALT_METADATA_SPOOL_MAX_BYTES: ${BAZALT_METADATA_SPOOL_MAX_BYTES:-2147483648}
+      BAZALT_CLICKHOUSE_TIMEOUT_MS: ${BAZALT_CLICKHOUSE_TIMEOUT_MS:-5000}
       BAZALT_FLOW_SHARDS: ${BAZALT_FLOW_SHARDS:-}
       PACKMATE_FLOW_SHARDS: ${PACKMATE_FLOW_SHARDS:-}
       BAZALT_L7_WORKERS: ${BAZALT_L7_WORKERS:-}
@@ -105,6 +115,8 @@ services:
       PACKMATE_LIVE_FLOW_UPDATE_MS: ${PACKMATE_LIVE_FLOW_UPDATE_MS:-}
       BAZALT_MAX_FLOW_BYTES: ${BAZALT_MAX_FLOW_BYTES:-}
       PACKMATE_MAX_FLOW_BYTES: ${PACKMATE_MAX_FLOW_BYTES:-}
+      BAZALT_MAX_ACTIVE_FLOWS: ${BAZALT_MAX_ACTIVE_FLOWS:-}
+      PACKMATE_MAX_ACTIVE_FLOWS: ${PACKMATE_MAX_ACTIVE_FLOWS:-}
       BAZALT_MAX_OOO_BYTES: ${BAZALT_MAX_OOO_BYTES:-}
       PACKMATE_MAX_OOO_BYTES: ${PACKMATE_MAX_OOO_BYTES:-}
       BAZALT_MAX_OOO_SEGMENTS: ${BAZALT_MAX_OOO_SEGMENTS:-}
@@ -119,17 +131,25 @@ services:
       PACKMATE_TUNNEL_DECAPSULATION: ${PACKMATE_TUNNEL_DECAPSULATION:-}
       BAZALT_MATCH_OVERLAP_BYTES: ${BAZALT_MATCH_OVERLAP_BYTES:-}
       PACKMATE_MATCH_OVERLAP_BYTES: ${PACKMATE_MATCH_OVERLAP_BYTES:-}
+      BAZALT_MATCH_MAX_HITS_PER_PATTERN: ${BAZALT_MATCH_MAX_HITS_PER_PATTERN:-}
+      PACKMATE_MATCH_MAX_HITS_PER_PATTERN: ${PACKMATE_MATCH_MAX_HITS_PER_PATTERN:-}
+      BAZALT_MATCH_MAX_HITS_PER_RECORD: ${BAZALT_MATCH_MAX_HITS_PER_RECORD:-}
+      PACKMATE_MATCH_MAX_HITS_PER_RECORD: ${PACKMATE_MATCH_MAX_HITS_PER_RECORD:-}
       BAZALT_SEGMENT_DIR: /data/segments
       BAZALT_SEGMENT_MAX_BYTES: ${BAZALT_SEGMENT_MAX_BYTES:-}
       PACKMATE_SEGMENT_MAX_BYTES: ${PACKMATE_SEGMENT_MAX_BYTES:-}
+      BAZALT_SEGMENT_MAX_RECORD_BYTES: ${BAZALT_SEGMENT_MAX_RECORD_BYTES:-}
+      PACKMATE_SEGMENT_MAX_RECORD_BYTES: ${PACKMATE_SEGMENT_MAX_RECORD_BYTES:-}
       BAZALT_RAW_CAPTURE: ${BAZALT_RAW_CAPTURE:-}
       PACKMATE_RAW_CAPTURE: ${PACKMATE_RAW_CAPTURE:-}
       BAZALT_RAW_SEGMENT_DIR: /data/raw
       BAZALT_PACKET_LOGGING: ${BAZALT_PACKET_LOGGING:-}
       PACKMATE_PACKET_LOGGING: ${PACKMATE_PACKET_LOGGING:-}
-      BAZALT_POSTGRES_URL: postgres://packmate:packmate@127.0.0.1:65001/packmate
+      BAZALT_POSTGRES_URL: "postgres://packmate:${BAZALT_POSTGRES_PASSWORD:?set BAZALT_POSTGRES_PASSWORD in .env}@127.0.0.1:65001/packmate"
       BAZALT_CLICKHOUSE_URL: http://127.0.0.1:65002
       BAZALT_CLICKHOUSE_DATABASE: packmate
+      BAZALT_CLICKHOUSE_USERNAME: bazalt
+      BAZALT_CLICKHOUSE_PASSWORD: ${BAZALT_CLICKHOUSE_PASSWORD:?set BAZALT_CLICKHOUSE_PASSWORD in .env}
       BAZALT_REPLAY_WORKERS: ${BAZALT_REPLAY_WORKERS:-}
       PACKMATE_REPLAY_WORKERS: ${PACKMATE_REPLAY_WORKERS:-}
       BAZALT_REPLAY_PAUSE_PCT: ${BAZALT_REPLAY_PAUSE_PCT:-}

@@ -1,10 +1,10 @@
-# BAZALT 0.4.1 verification
+# BAZALT 0.4.1.2 verification
 
 The artifact-generation environment does not provide a local Rust toolchain or Docker daemon. Therefore this release does **not** claim a native Rust compile in that environment.
 
-The local library and binary roots use `#![deny(warnings)]`, so rustc warnings in BAZALT itself fail the native build instead of scrolling past. `scripts/verify_source.sh` additionally runs rustfmt/clippy when a Rust toolchain is available.
+The local library and binary roots use `#![deny(warnings)]`, so rustc warnings in BAZALT itself fail the native build instead of scrolling past. `scripts/verify_source.sh` now requires a Rust toolchain and fails instead of silently skipping rustfmt/clippy/tests/build.
 
-The Dockerfile remains the authoritative native gate and executes:
+The Dockerfile remains a native release gate and executes:
 
 ```bash
 cargo test --release --all-features
@@ -26,7 +26,7 @@ Compose YAML is parsed separately before packaging.
 
 The static verifier checks, among other invariants:
 
-- BAZALT 0.4.1 package/version and Docker compile gate;
+- release label `0.4.1.2`, Cargo-compatible SemVer `0.4.1+hotfix.2`, and Docker compile gate;
 - packet logging disabled by default;
 - bounded queues and direct sharded data-plane topology;
 - AF_XDP RX-queue auto-discovery plus all-or-nothing queue-set fallback;
@@ -54,7 +54,23 @@ The static verifier checks, among other invariants:
 - incremental CRC/direct segment payload write;
 - batched per-segment content reads;
 - metadata coalescing window;
-- historical replay behavior and prior HTTP/raw presentation invariants.
+- historical replay behavior and prior HTTP/raw presentation invariants;
+- host-loopback-only PostgreSQL/ClickHouse publication and no native ClickHouse host port;
+- replay worker/hit/metadata barriers before per-segment checkpoint advancement;
+- traffic-time timestamps for live and historical match rows;
+- strict segment corruption propagation plus newest-tail-only crash recovery;
+- pre-allocation segment record-length limits;
+- new-flow-only global active-flow admission;
+- bounded per-pattern/per-record match amplification;
+- restored new-flow creation state from the 0.4.1 reference path;
+- durable metadata spool decoupling ClickHouse outages from replay checkpoints;
+- explicit ClickHouse request timeout and authenticated ClickHouse client;
+- critical-worker supervision plus protected cheap `/api/health`;
+- auth-aware Docker HEALTHCHECK;
+- fail-fast invalid boolean configuration;
+- bounded gzip/deflate expansion ratio and reduced decoded-body absolute cap;
+- newest-segment content-index startup reconciliation;
+- metadata-spool occupancy in metrics/live-pressure throttling.
 
 Full acceptance on a Linux Docker host:
 
@@ -64,7 +80,7 @@ Full acceptance on a Linux Docker host:
 
 `smoke.sh` retains the functional regression path: service CRUD, configured-port filtering, open flow without FIN/RST, User-Agent filters, historical replay, HTTP/raw deduplication, raw-hit projection and payload retrieval.
 
-## 0.4.1 compile/capture regression gates
+## 0.4.1.2 compile/capture regression gates
 
 The HTTP test configuration includes both `early_port_filter` and
 `capture_enqueue_timeout`; this prevents new `Config` fields from breaking the
@@ -86,4 +102,4 @@ Capture diagnostics are intentionally split into two levels:
 python3 scripts/verify_v04_hotpath.py
 ```
 
-This separately checks that normal in-order/unfragmented traffic does not enter fragment/OOO slow paths and that adversarial slow-path state has byte and object-count bounds.
+This separately checks that normal in-order/unfragmented traffic does not enter fragment/OOO slow paths, that global flow admission does not add synchronization to existing-flow packets, and that match-amplification bounds remain on the positive-match slow path.

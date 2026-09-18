@@ -13,7 +13,10 @@ def text(rel: str) -> str:
 
 cargo = tomllib.loads(text("Cargo.toml"))
 assert cargo["package"]["name"] == "bazalt"
-assert cargo["package"]["version"] == "0.4.1"
+assert cargo["package"]["version"] == "0.4.1+hotfix.2"
+assert text("VERSION").strip() == "0.4.1.2"
+assert 'cargo:rustc-env=BAZALT_RELEASE_VERSION=' in text("build.rs")
+assert 'env!("BAZALT_RELEASE_VERSION")' in text("src/api/mod.rs")
 assert "afxdp" in cargo["features"]["default"]
 assert "serde" in cargo["dependencies"]["bytes"].get("features", []), "bytes::Bytes models require the bytes serde feature"
 
@@ -59,6 +62,55 @@ assert 'ENTRYPOINT ["/usr/local/bin/bazalt"]' in dockerfile
 assert "libxdp-dev" in dockerfile
 assert "XDP_ZEROCOPY" in text("native/afxdp.c") and "XDP_COPY" in text("native/afxdp.c")
 assert "postgres:" in text("docker-compose.yml") and "clickhouse:" in text("docker-compose.yml")
+
+# 0.4.1.x P0 tranche: control-plane isolation, crash-consistent replay,
+# strict/capped segments, bounded flow admission and bounded match fanout.
+compose = text("docker-compose.yml")
+replay = text("src/replay/mod.rs")
+segment = text("src/storage/segment.rs")
+matching = text("src/matching/mod.rs")
+flow = text("src/flow/mod.rs")
+assert '"127.0.0.1:65001:5432"' in compose
+assert '"127.0.0.1:65002:8123"' in compose
+assert "65003:9000" not in compose
+assert "ReplayWork::Barrier" in replay and "ReplayHit::Barrier" in replay
+assert "metadata_tx.durable_barrier()?" in replay
+assert replay.index("metadata_tx.durable_barrier()?") < replay.index("segments_done += 1"), "replay checkpoint must follow durable metadata barrier"
+assert "timestamp: ns_to_datetime(record.ts_ns)" in matching
+assert "recover_last_segment_tail" in segment
+assert "corrupt segment {} at offset" in segment and "stopping at invalid segment tail" not in segment
+assert "segment record length {len} exceeds configured maximum" in segment
+assert "exceeds remaining file payload bytes" in segment
+assert 'parse_env("PACKMATE_MAX_ACTIVE_FLOWS", 262_144usize)' in text("src/config.rs")
+http_source = text("src/http/mod.rs")
+test_cfg = http_source.split("fn test_cfg() -> Config", 1)[1]
+for field in ("max_active_flows:", "matcher_max_hits_per_pattern:", "matcher_max_hits_per_record:", "segment_max_record_bytes:"):
+    assert field in test_cfg, f"Config test literal missing {field}"
+assert "try_admit_flow" in flow and "flow_state_rejections" in flow
+assert "scan_bounded" in matching and "max_hits_per_pattern" in matching and "max_hits_per_record" in matching
+assert "matcher_match_limit_events_total" in text("src/metrics.rs")
+
+# 0.4.1.2 second stabilization tranche.
+storage = text("src/storage/mod.rs")
+spool = text("src/storage/spool.rs")
+api = text("src/api/mod.rs")
+config = text("src/config.rs")
+dockerfile = text("Dockerfile")
+smoke = text("scripts/smoke.sh")
+assert "let (state, is_new_flow)" in flow and "is_new_flow.then_some(state.id)" in flow
+assert "mod spool;" in storage and "MetadataSpool::open" in storage
+assert "durable_barrier" in storage and "metadata_spool_max_bytes" in config
+assert "metadata_spool_bytes" in text("src/metrics.rs") and "metadata_spool_capacity" in text("src/metrics.rs")
+assert "projector_shutdown_flag" in storage and "clickhouse_request_timeout" in config
+assert '.route("/api/health", get(health))' in api and 'StatusCode::SERVICE_UNAVAILABLE' in api
+assert "/api/health" in dockerfile and 'BAZALT_AUTH_USERNAME' in dockerfile and 'BAZALT_AUTH_PASSWORD' in dockerfile
+assert "critical_worker_finished" in text("src/runtime.rs") and "critical data-plane worker exited unexpectedly" in text("src/runtime.rs")
+assert "http_max_decode_ratio" in config and "saturating_mul(max_ratio)" in http_source
+assert '16 * 1024 * 1024' in config, "decoded-body default should be reduced from the old 128 MiB cap"
+assert "invalid {} boolean value" in config and "fn parse_bool_env(legacy_key: &str, default: bool) -> Result<bool>" in config
+assert "BAZALT_POSTGRES_PASSWORD" in compose and "BAZALT_CLICKHOUSE_PASSWORD" in compose
+assert "bazalt-smoke-postgres" in smoke and "bazalt-smoke-clickhouse" in smoke
+assert "stale metadata spool temp" in spool
 
 # Live visibility and configured-port-only capture invariants.
 assert "FlowOutput::Snapshot" in text("src/flow/mod.rs")
@@ -215,4 +267,4 @@ assert "timers.len() > 4096" in text("src/flow/mod.rs")
 assert "queue_enqueued" in text("src/metrics.rs") and "queue_dequeued" in text("src/metrics.rs")
 assert "DefaultHasher" not in text("src/replay/mod.rs")
 
-print("STATIC PASS: BAZALT 0.4.1 traffic-fidelity, bounded slow paths, auth/management, adaptive CPU and prior safety/UI invariants verified")
+print("STATIC PASS: BAZALT 0.4.1.2 fidelity, durable metadata isolation, supervision, bounded decode/config and prior invariants verified")

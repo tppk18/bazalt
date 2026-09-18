@@ -1,5 +1,5 @@
-mod parser;
 mod fragment;
+mod parser;
 mod pcap_source;
 mod raw;
 
@@ -7,7 +7,10 @@ mod raw;
 mod afxdp;
 
 use std::{
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,11 +18,16 @@ use anyhow::Result;
 use bytes::Bytes;
 use tracing::{debug, warn};
 
-use crate::{config::{CaptureMode, Config}, flow::FlowIngress, http::ServiceRegistry, metrics::Metrics};
+use crate::{
+    config::{CaptureMode, Config},
+    flow::FlowIngress,
+    http::ServiceRegistry,
+    metrics::Metrics,
+};
 
+use fragment::SharedFragmentCache;
 pub use parser::parse_ethernet_frame;
 use parser::{DecodeOutcome, PacketDecoder};
-use fragment::SharedFragmentCache;
 
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
@@ -63,16 +71,29 @@ impl CaptureRuntime {
     pub fn shutdown_and_join(self) -> Result<()> {
         self.shutdown.store(true, Ordering::Release);
         for handle in self.capture_handles {
-            handle.join().map_err(|_| anyhow::anyhow!("capture worker panicked"))?;
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("capture worker panicked"))?;
         }
         // Raw writers only terminate after capture workers drop their senders.
         for handle in self.raw_handles {
-            handle.join().map_err(|_| anyhow::anyhow!("raw capture writer panicked"))?;
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("raw capture writer panicked"))?;
         }
         Ok(())
     }
 
-    pub fn worker_count(&self) -> usize { self.capture_handles.len() }
+    pub fn worker_count(&self) -> usize {
+        self.capture_handles.len()
+    }
+
+    pub fn critical_worker_finished(&self) -> bool {
+        self.capture_handles
+            .iter()
+            .chain(self.raw_handles.iter())
+            .any(std::thread::JoinHandle::is_finished)
+    }
 }
 
 pub fn spawn_capture_workers(
@@ -83,7 +104,11 @@ pub fn spawn_capture_workers(
     shutdown: Arc<AtomicBool>,
 ) -> Result<CaptureRuntime> {
     if cfg.capture_mode == CaptureMode::Disabled {
-        return Ok(CaptureRuntime { capture_handles: Vec::new(), raw_handles: Vec::new(), shutdown });
+        return Ok(CaptureRuntime {
+            capture_handles: Vec::new(),
+            raw_handles: Vec::new(),
+            shutdown,
+        });
     }
 
     // Prepare capture backends before any worker starts consuming traffic. AF_XDP
@@ -185,6 +210,7 @@ pub fn spawn_capture_workers(
                 let mut last_source_stats = SourceStats::default();
                 let mut last_stats_poll = Instant::now();
                 loop {
+                    metrics.touch_progress();
                     if shutdown2.load(Ordering::Acquire) { break; }
                     let generation = services.generation();
                     if generation != service_generation {
@@ -318,7 +344,11 @@ pub fn spawn_capture_workers(
                 }
             })?);
     }
-    Ok(CaptureRuntime { capture_handles, raw_handles, shutdown })
+    Ok(CaptureRuntime {
+        capture_handles,
+        raw_handles,
+        shutdown,
+    })
 }
 
 fn create_source(cfg: &Config, queue_id: u32) -> Result<Box<dyn FrameSource>> {
@@ -328,10 +358,14 @@ fn create_source(cfg: &Config, queue_id: u32) -> Result<Box<dyn FrameSource>> {
         CaptureMode::AfXdp => {
             #[cfg(feature = "afxdp")]
             {
-                Ok(Box::new(afxdp::AfXdpSource::open(&cfg.interface, queue_id)?))
+                Ok(Box::new(afxdp::AfXdpSource::open(
+                    &cfg.interface,
+                    queue_id,
+                )?))
             }
             #[cfg(not(feature = "afxdp"))]
             {
+                let _ = queue_id;
                 anyhow::bail!("binary was built without the afxdp feature")
             }
         }
@@ -340,5 +374,8 @@ fn create_source(cfg: &Config, queue_id: u32) -> Result<Box<dyn FrameSource>> {
 }
 
 pub fn unix_now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }

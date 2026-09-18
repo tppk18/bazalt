@@ -1,4 +1,8 @@
-use std::{ffi::CString, os::raw::{c_char, c_int, c_uint}, ptr::NonNull};
+use std::{
+    ffi::CString,
+    os::raw::{c_char, c_int, c_uint},
+    ptr::NonNull,
+};
 
 use anyhow::{bail, Result};
 use bytes::BytesMut;
@@ -24,12 +28,20 @@ struct PmXdpHandle {
 }
 
 extern "C" {
-    fn pm_xdp_open(ifname: *const c_char, queue_id: c_uint, prefer_zerocopy: c_int) -> *mut PmXdpHandle;
+    fn pm_xdp_open(
+        ifname: *const c_char,
+        queue_id: c_uint,
+        prefer_zerocopy: c_int,
+    ) -> *mut PmXdpHandle;
     fn pm_xdp_fd(handle: *mut PmXdpHandle) -> c_int;
     fn pm_xdp_multibuf_enabled(handle: *mut PmXdpHandle) -> c_int;
     fn pm_xdp_peek(handle: *mut PmXdpHandle, frames: *mut PmXdpFrame, max_frames: c_uint) -> c_int;
     fn pm_xdp_release(handle: *mut PmXdpHandle, frames: *const PmXdpFrame, count: c_uint) -> c_int;
-    fn pm_xdp_stats(handle: *mut PmXdpHandle, rx_dropped: *mut u64, rx_invalid_descs: *mut u64) -> c_int;
+    fn pm_xdp_stats(
+        handle: *mut PmXdpHandle,
+        rx_dropped: *mut u64,
+        rx_invalid_descs: *mut u64,
+    ) -> c_int;
     fn pm_xdp_last_error() -> *const c_char;
     fn pm_xdp_close(handle: *mut PmXdpHandle);
     fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int) -> c_int;
@@ -75,7 +87,12 @@ impl AfXdpSource {
         Ok(Self {
             handle,
             fd,
-            frames: [PmXdpFrame { data: std::ptr::null(), len: 0, addr: 0, options: 0 }; MAX_BATCH],
+            frames: [PmXdpFrame {
+                data: std::ptr::null(),
+                len: 0,
+                addr: 0,
+                options: 0,
+            }; MAX_BATCH],
             pending_multibuf: BytesMut::new(),
             pending_wire_len: 0,
         })
@@ -100,7 +117,11 @@ impl FrameSource for AfXdpSource {
             bail!("AF_XDP receive: {}", last_error());
         }
         if n == 0 {
-            let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             let polled = unsafe { poll(&mut pfd, 1, 10) };
             if polled < 0 {
                 return Err(std::io::Error::last_os_error().into());
@@ -151,7 +172,8 @@ impl FrameSource for AfXdpSource {
                     data: batch.slice(start..start + len),
                 });
             } else {
-                self.pending_multibuf.extend_from_slice(&batch[start..start + len]);
+                self.pending_multibuf
+                    .extend_from_slice(&batch[start..start + len]);
                 self.pending_wire_len = self.pending_wire_len.saturating_add(len);
                 if !continued {
                     out.push(CapturedFrame {
@@ -183,7 +205,10 @@ impl FrameSource for AfXdpSource {
         if rc < 0 {
             bail!("AF_XDP statistics: {}", last_error());
         }
-        Ok(Some(SourceStats { dropped, invalid_descs }))
+        Ok(Some(SourceStats {
+            dropped,
+            invalid_descs,
+        }))
     }
 }
 

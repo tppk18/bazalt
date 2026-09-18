@@ -5,7 +5,10 @@ use chrono::Utc;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
-use crate::model::{ContentView, NewPattern, PatternAction, PatternDirection, PatternKind, PatternRef, PatternRevision, ReplayJob, ServiceConfig};
+use crate::model::{
+    ContentView, NewPattern, PatternAction, PatternDirection, PatternKind, PatternRef,
+    PatternRevision, ReplayJob, ServiceConfig,
+};
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -24,7 +27,9 @@ impl PostgresStore {
                 }
             }
         }
-        Err(last.map(anyhow::Error::from).unwrap_or_else(|| anyhow::anyhow!("postgres connection failed")))
+        Err(last
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("postgres connection failed")))
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -147,11 +152,17 @@ impl PostgresStore {
         Ok(out)
     }
 
-    pub async fn update_pattern(&self, id: Uuid, p: NewPattern, enabled: bool) -> Result<PatternRevision> {
-        let revision: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(revision), 0) + 1 FROM patterns WHERE id = $1")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn update_pattern(
+        &self,
+        id: Uuid,
+        p: NewPattern,
+        enabled: bool,
+    ) -> Result<PatternRevision> {
+        let revision: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(revision), 0) + 1 FROM patterns WHERE id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
         let out = PatternRevision {
             id,
             revision,
@@ -194,16 +205,37 @@ impl PostgresStore {
     }
 
     pub async fn delete_pattern(&self, id: Uuid) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM patterns WHERE id=$1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+        // Pattern revisions are referenced by durable replay jobs.  A physical
+        // delete made an interrupted job unrecoverable and also erased audit
+        // history.  Tombstone the latest revision instead; list_enabled_patterns
+        // already selects the latest revision before filtering `enabled`.
+        let Some(current) = self.latest_pattern(id).await? else {
+            return Ok(false);
+        };
+        if !current.enabled {
+            return Ok(false);
+        }
+        let tombstone = PatternRevision {
+            revision: current.revision + 1,
+            enabled: false,
+            created_at: Utc::now(),
+            ..current
+        };
+        self.insert_pattern_revision(&tombstone).await?;
+        Ok(true)
     }
 
     pub async fn set_pattern_enabled(&self, id: Uuid, enabled: bool) -> Result<PatternRevision> {
-        let current = self.latest_pattern(id).await?.context("pattern not found")?;
-        let next = PatternRevision { revision: current.revision + 1, enabled, created_at: Utc::now(), ..current };
+        let current = self
+            .latest_pattern(id)
+            .await?
+            .context("pattern not found")?;
+        let next = PatternRevision {
+            revision: current.revision + 1,
+            enabled,
+            created_at: Utc::now(),
+            ..current
+        };
         self.insert_pattern_revision(&next).await?;
         Ok(next)
     }
@@ -219,7 +251,11 @@ impl PostgresStore {
         row.map(row_to_pattern).transpose()
     }
 
-    pub async fn pattern_revision(&self, id: Uuid, revision: i64) -> Result<Option<PatternRevision>> {
+    pub async fn pattern_revision(
+        &self,
+        id: Uuid,
+        revision: i64,
+    ) -> Result<Option<PatternRevision>> {
         let row = sqlx::query(
             r#"SELECT id, revision, name, expression, kind, action, color, direction_type, service, view, enabled, created_at
                FROM patterns WHERE id=$1 AND revision=$2 LIMIT 1"#,
@@ -231,12 +267,27 @@ impl PostgresStore {
         row.map(row_to_pattern).transpose()
     }
 
-    pub async fn create_replay_job(&self, patterns: &[PatternRevision], segment_paths: &[std::path::PathBuf]) -> Result<ReplayJob> {
+    pub async fn create_replay_job(
+        &self,
+        patterns: &[PatternRevision],
+        segment_paths: &[std::path::PathBuf],
+    ) -> Result<ReplayJob> {
         let now = Utc::now();
         let pattern_ids = patterns.iter().map(|p| p.id).collect::<Vec<_>>();
-        let pattern_revisions = patterns.iter().map(|p| PatternRef { id: p.id, revision: p.revision }).collect::<Vec<_>>();
-        let segment_cutoff = segment_paths.last().map(|p| p.to_string_lossy().into_owned());
-        let frozen_paths = segment_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let pattern_revisions = patterns
+            .iter()
+            .map(|p| PatternRef {
+                id: p.id,
+                revision: p.revision,
+            })
+            .collect::<Vec<_>>();
+        let segment_cutoff = segment_paths
+            .last()
+            .map(|p| p.to_string_lossy().into_owned());
+        let frozen_paths = segment_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         let job = ReplayJob {
             id: Uuid::new_v4(),
             pattern_ids,
@@ -316,7 +367,8 @@ impl PostgresStore {
             let json: serde_json::Value = row.try_get("pattern_ids")?;
             let pattern_ids: Vec<Uuid> = serde_json::from_value(json)?;
             let refs_json: serde_json::Value = row.try_get("pattern_revisions")?;
-            let pattern_revisions: Vec<PatternRef> = serde_json::from_value(refs_json).unwrap_or_default();
+            let pattern_revisions: Vec<PatternRef> =
+                serde_json::from_value(refs_json).unwrap_or_default();
             let paths_json: serde_json::Value = row.try_get("segment_paths")?;
             let segment_paths: Vec<String> = serde_json::from_value(paths_json).unwrap_or_default();
             out.push(ReplayJob {
@@ -341,16 +393,22 @@ impl PostgresStore {
     pub async fn set_favorite(&self, flow_id: Uuid, favorite: bool) -> Result<()> {
         if favorite {
             sqlx::query("INSERT INTO favorites(flow_id) VALUES($1) ON CONFLICT DO NOTHING")
-                .bind(flow_id).execute(&self.pool).await?;
+                .bind(flow_id)
+                .execute(&self.pool)
+                .await?;
         } else {
             sqlx::query("DELETE FROM favorites WHERE flow_id=$1")
-                .bind(flow_id).execute(&self.pool).await?;
+                .bind(flow_id)
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
 
     pub async fn list_favorites(&self) -> Result<Vec<Uuid>> {
-        Ok(sqlx::query_scalar("SELECT flow_id FROM favorites").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT flow_id FROM favorites")
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     pub async fn upsert_service(&self, service: &ServiceConfig) -> Result<ServiceConfig> {
@@ -403,9 +461,7 @@ impl PostgresStore {
         .await?;
         rows.into_iter().map(row_to_service).collect()
     }
-
 }
-
 
 fn row_to_service(row: sqlx::postgres::PgRow) -> Result<ServiceConfig> {
     let port = row.try_get::<i32, _>("port")?;
@@ -433,16 +489,67 @@ fn row_to_pattern(row: sqlx::postgres::PgRow) -> Result<PatternRevision> {
         color: row.try_get("color")?,
         direction_type: parse_direction(&row.try_get::<String, _>("direction_type")?)?,
         service: row.try_get("service")?,
-        view: row.try_get::<Option<String>, _>("view")?.map(|s| parse_view(&s)).transpose()?,
+        view: row
+            .try_get::<Option<String>, _>("view")?
+            .map(|s| parse_view(&s))
+            .transpose()?,
         enabled: row.try_get("enabled")?,
         created_at: row.try_get("created_at")?,
     })
 }
 
-fn kind_str(v: PatternKind) -> &'static str { match v { PatternKind::Text => "text", PatternKind::Binary => "binary", PatternKind::Regex => "regex" } }
-fn action_str(v: PatternAction) -> &'static str { match v { PatternAction::Find => "find", PatternAction::Ignore => "ignore" } }
-fn direction_str(v: PatternDirection) -> &'static str { match v { PatternDirection::Both => "both", PatternDirection::Input => "input", PatternDirection::Output => "output" } }
-fn parse_kind(v:&str)->Result<PatternKind>{match v{"text"=>Ok(PatternKind::Text),"binary"=>Ok(PatternKind::Binary),"regex"=>Ok(PatternKind::Regex),_=>anyhow::bail!("unknown pattern kind {v}")}}
-fn parse_action(v:&str)->Result<PatternAction>{match v{"find"=>Ok(PatternAction::Find),"ignore"=>Ok(PatternAction::Ignore),_=>anyhow::bail!("unknown pattern action {v}")}}
-fn parse_direction(v:&str)->Result<PatternDirection>{match v{"both"=>Ok(PatternDirection::Both),"input"=>Ok(PatternDirection::Input),"output"=>Ok(PatternDirection::Output),_=>anyhow::bail!("unknown pattern direction {v}")}}
-fn parse_view(v:&str)->Result<ContentView>{match v{"tcp_raw"=>Ok(ContentView::TcpRaw),"http_request_headers"=>Ok(ContentView::HttpRequestHeaders),"http_request_body"=>Ok(ContentView::HttpRequestBody),"http_request_decoded_body"=>Ok(ContentView::HttpRequestDecodedBody),"http_response_headers"=>Ok(ContentView::HttpResponseHeaders),"http_response_body"=>Ok(ContentView::HttpResponseBody),"http_response_decoded_body"=>Ok(ContentView::HttpResponseDecodedBody),_=>anyhow::bail!("unknown content view {v}")}}
+fn kind_str(v: PatternKind) -> &'static str {
+    match v {
+        PatternKind::Text => "text",
+        PatternKind::Binary => "binary",
+        PatternKind::Regex => "regex",
+    }
+}
+fn action_str(v: PatternAction) -> &'static str {
+    match v {
+        PatternAction::Find => "find",
+        PatternAction::Ignore => "ignore",
+    }
+}
+fn direction_str(v: PatternDirection) -> &'static str {
+    match v {
+        PatternDirection::Both => "both",
+        PatternDirection::Input => "input",
+        PatternDirection::Output => "output",
+    }
+}
+fn parse_kind(v: &str) -> Result<PatternKind> {
+    match v {
+        "text" => Ok(PatternKind::Text),
+        "binary" => Ok(PatternKind::Binary),
+        "regex" => Ok(PatternKind::Regex),
+        _ => anyhow::bail!("unknown pattern kind {v}"),
+    }
+}
+fn parse_action(v: &str) -> Result<PatternAction> {
+    match v {
+        "find" => Ok(PatternAction::Find),
+        "ignore" => Ok(PatternAction::Ignore),
+        _ => anyhow::bail!("unknown pattern action {v}"),
+    }
+}
+fn parse_direction(v: &str) -> Result<PatternDirection> {
+    match v {
+        "both" => Ok(PatternDirection::Both),
+        "input" => Ok(PatternDirection::Input),
+        "output" => Ok(PatternDirection::Output),
+        _ => anyhow::bail!("unknown pattern direction {v}"),
+    }
+}
+fn parse_view(v: &str) -> Result<ContentView> {
+    match v {
+        "tcp_raw" => Ok(ContentView::TcpRaw),
+        "http_request_headers" => Ok(ContentView::HttpRequestHeaders),
+        "http_request_body" => Ok(ContentView::HttpRequestBody),
+        "http_request_decoded_body" => Ok(ContentView::HttpRequestDecodedBody),
+        "http_response_headers" => Ok(ContentView::HttpResponseHeaders),
+        "http_response_body" => Ok(ContentView::HttpResponseBody),
+        "http_response_decoded_body" => Ok(ContentView::HttpResponseDecodedBody),
+        _ => anyhow::bail!("unknown content view {v}"),
+    }
+}

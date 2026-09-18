@@ -81,15 +81,19 @@ impl PcapWriter {
     fn write(&mut self, frame: &CapturedFrame) -> Result<()> {
         let incl = frame.data.len().min(u32::MAX as usize) as u32;
         let record_len = 16u64 + incl as u64;
-        if self.bytes > PCAP_GLOBAL_HEADER.len() as u64 && self.bytes.saturating_add(record_len) > self.max_bytes {
+        if self.bytes > PCAP_GLOBAL_HEADER.len() as u64
+            && self.bytes.saturating_add(record_len) > self.max_bytes
+        {
             self.rotate()?;
         }
         let sec = frame.ts_ns / 1_000_000_000;
         let usec = (frame.ts_ns % 1_000_000_000) / 1000;
-        self.file.write_all(&(sec.min(u32::MAX as u64) as u32).to_le_bytes())?;
+        self.file
+            .write_all(&(sec.min(u32::MAX as u64) as u32).to_le_bytes())?;
         self.file.write_all(&(usec as u32).to_le_bytes())?;
         self.file.write_all(&incl.to_le_bytes())?;
-        self.file.write_all(&(frame.wire_len.min(u32::MAX as usize) as u32).to_le_bytes())?;
+        self.file
+            .write_all(&(frame.wire_len.min(u32::MAX as usize) as u32).to_le_bytes())?;
         self.file.write_all(&frame.data[..incl as usize])?;
         self.bytes += record_len;
         Ok(())

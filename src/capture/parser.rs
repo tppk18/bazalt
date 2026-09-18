@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr}, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -9,7 +12,10 @@ use crate::{
     model::{FlowKey, ParsedPacket, TcpFlags, TransportProtocol},
 };
 
-use super::{fragment::{FragmentInsert, FragmentKey, SharedFragmentCache}, CapturedFrame};
+use super::{
+    fragment::{FragmentInsert, FragmentKey, SharedFragmentCache},
+    CapturedFrame,
+};
 
 const MAX_TUNNEL_DEPTH: usize = 3;
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -57,13 +63,7 @@ impl PacketDecoder {
     }
 
     pub fn decode(&mut self, frame: CapturedFrame) -> Result<DecodeOutcome> {
-        let outcome = self.decode_ethernet_bytes(
-            frame.ts_ns,
-            frame.wire_len,
-            frame.data,
-            0,
-            0,
-        )?;
+        let outcome = self.decode_ethernet_bytes(frame.ts_ns, frame.wire_len, frame.data, 0, 0)?;
         Ok(match outcome {
             InnerOutcome::Packet(packet) => DecodeOutcome::Packet(packet),
             InnerOutcome::PendingFragment => DecodeOutcome::PendingFragment,
@@ -144,11 +144,18 @@ impl PacketDecoder {
         }
         if total_len > packet.len() {
             self.mark_truncated();
-            bail!("truncated ipv4 packet: declared {total_len}, captured {}", packet.len());
+            bail!(
+                "truncated ipv4 packet: declared {total_len}, captured {}",
+                packet.len()
+            );
         }
 
-        let src = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
-        let dst = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+        let src = IpAddr::V4(Ipv4Addr::new(
+            packet[12], packet[13], packet[14], packet[15],
+        ));
+        let dst = IpAddr::V4(Ipv4Addr::new(
+            packet[16], packet[17], packet[18], packet[19],
+        ));
         let protocol = packet[9];
         let frag = u16::from_be_bytes([packet[6], packet[7]]);
         let offset = ((frag & 0x1fff) as usize) * 8;
@@ -165,13 +172,7 @@ impl PacketDecoder {
                 id: u16::from_be_bytes([packet[4], packet[5]]) as u32,
                 next_header: protocol,
             };
-            let (result, maintenance) = self.fragments.insert(
-                key,
-                offset,
-                more,
-                payload,
-                wire_len,
-            );
+            let (result, maintenance) = self.fragments.insert(key, offset, more, payload, wire_len);
             self.apply_fragment_maintenance(maintenance);
             return match result {
                 FragmentInsert::Pending => Ok(InnerOutcome::PendingFragment),
@@ -180,14 +181,21 @@ impl PacketDecoder {
                     Ok(InnerOutcome::Ignored)
                 }
                 FragmentInsert::DroppedInvalid => Ok(InnerOutcome::Ignored),
-                FragmentInsert::Complete { payload, wire_bytes } => {
+                FragmentInsert::Complete {
+                    payload,
+                    wire_bytes,
+                } => {
                     self.fragment_reassembled();
-                    self.decode_ip_payload(ts_ns, wire_bytes, src, dst, protocol, payload, l2_domain, depth)
+                    self.decode_ip_payload(
+                        ts_ns, wire_bytes, src, dst, protocol, payload, l2_domain, depth,
+                    )
                 }
             };
         }
 
-        self.decode_ip_payload(ts_ns, wire_len, src, dst, protocol, payload, l2_domain, depth)
+        self.decode_ip_payload(
+            ts_ns, wire_len, src, dst, protocol, payload, l2_domain, depth,
+        )
     }
 
     fn decode_ipv6(
@@ -209,10 +217,17 @@ impl PacketDecoder {
         let ip_len = 40usize.saturating_add(payload_len);
         if ip_len > packet.len() {
             self.mark_truncated();
-            bail!("truncated ipv6 packet: declared {ip_len}, captured {}", packet.len());
+            bail!(
+                "truncated ipv6 packet: declared {ip_len}, captured {}",
+                packet.len()
+            );
         }
-        let src = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("slice length")));
-        let dst = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("slice length")));
+        let src = IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&packet[8..24]).expect("slice length"),
+        ));
+        let dst = IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&packet[24..40]).expect("slice length"),
+        ));
         let mut next = packet[6];
         let mut offset = 40usize;
 
@@ -255,7 +270,10 @@ impl PacketDecoder {
                     let fragment_offset = (frag & 0xfff8) as usize;
                     let more = frag & 1 != 0;
                     let id = u32::from_be_bytes([
-                        packet[offset + 4], packet[offset + 5], packet[offset + 6], packet[offset + 7],
+                        packet[offset + 4],
+                        packet[offset + 5],
+                        packet[offset + 6],
+                        packet[offset + 7],
                     ]);
                     let fragment_payload = packet.slice(offset + 8..ip_len);
 
@@ -298,17 +316,13 @@ impl PacketDecoder {
                             Ok(InnerOutcome::Ignored)
                         }
                         FragmentInsert::DroppedInvalid => Ok(InnerOutcome::Ignored),
-                        FragmentInsert::Complete { payload, wire_bytes } => {
+                        FragmentInsert::Complete {
+                            payload,
+                            wire_bytes,
+                        } => {
                             self.fragment_reassembled();
                             self.decode_ipv6_post_fragment(
-                                ts_ns,
-                                wire_bytes,
-                                src,
-                                dst,
-                                frag_next,
-                                payload,
-                                l2_domain,
-                                depth,
+                                ts_ns, wire_bytes, src, dst, frag_next, payload, l2_domain, depth,
                             )
                         }
                     };
@@ -376,7 +390,16 @@ impl PacketDecoder {
                 _ => break,
             }
         }
-        self.decode_ip_payload(ts_ns, wire_len, src, dst, next, payload.slice(offset..), l2_domain, depth)
+        self.decode_ip_payload(
+            ts_ns,
+            wire_len,
+            src,
+            dst,
+            next,
+            payload.slice(offset..),
+            l2_domain,
+            depth,
+        )
     }
 
     fn decode_ip_payload(
@@ -391,7 +414,9 @@ impl PacketDecoder {
         depth: usize,
     ) -> Result<InnerOutcome> {
         match protocol {
-            6 => self.parse_tcp(ts_ns, wire_len, src, dst, payload, l2_domain).map(InnerOutcome::Packet),
+            6 => self
+                .parse_tcp(ts_ns, wire_len, src, dst, payload, l2_domain)
+                .map(InnerOutcome::Packet),
             17 => self.decode_udp(ts_ns, wire_len, src, dst, payload, l2_domain, depth),
             47 if self.tunnel_decapsulation && depth < MAX_TUNNEL_DEPTH => {
                 self.decode_gre(ts_ns, wire_len, src, dst, payload, l2_domain, depth)
@@ -442,7 +467,12 @@ impl PacketDecoder {
             ack: bits & 0x10 != 0,
         };
         let (key, direction) = FlowKey::canonical_with_domain(
-            src, src_port, dst, dst_port, TransportProtocol::Tcp, l2_domain,
+            src,
+            src_port,
+            dst,
+            dst_port,
+            TransportProtocol::Tcp,
+            l2_domain,
         );
         Ok(ParsedPacket {
             ts_ns,
@@ -478,10 +508,14 @@ impl PacketDecoder {
         }
         if udp_len > udp.len() {
             self.mark_truncated();
-            bail!("truncated udp datagram: declared {udp_len}, captured {}", udp.len());
+            bail!(
+                "truncated udp datagram: declared {udp_len}, captured {}",
+                udp.len()
+            );
         }
 
-        if self.tunnel_decapsulation && depth < MAX_TUNNEL_DEPTH && matches!(dst_port, 4789 | 8472) {
+        if self.tunnel_decapsulation && depth < MAX_TUNNEL_DEPTH && matches!(dst_port, 4789 | 8472)
+        {
             let vxlan = udp.slice(8..udp_len);
             if vxlan.len() >= 8 && vxlan[0] & 0x08 != 0 {
                 let vni = ((vxlan[4] as u64) << 16) | ((vxlan[5] as u64) << 8) | vxlan[6] as u64;
@@ -497,7 +531,12 @@ impl PacketDecoder {
         }
 
         let (key, direction) = FlowKey::canonical_with_domain(
-            src, src_port, dst, dst_port, TransportProtocol::Udp, l2_domain,
+            src,
+            src_port,
+            dst,
+            dst_port,
+            TransportProtocol::Udp,
+            l2_domain,
         );
         Ok(InnerOutcome::Packet(ParsedPacket {
             ts_ns,
@@ -535,13 +574,22 @@ impl PacketDecoder {
         }
         let proto = u16::from_be_bytes([gre[2], gre[3]]);
         let mut offset = 4usize;
-        if flags & 0xc000 != 0 { // checksum or routing-present share the checksum/reserved word
+        if flags & 0xc000 != 0 {
+            // checksum or routing-present share the checksum/reserved word
             offset = offset.saturating_add(4);
         }
         let mut gre_key = 0u64;
         if flags & 0x2000 != 0 {
-            if offset + 4 > gre.len() { self.mark_truncated(); bail!("truncated GRE key"); }
-            gre_key = u32::from_be_bytes([gre[offset], gre[offset+1], gre[offset+2], gre[offset+3]]) as u64;
+            if offset + 4 > gre.len() {
+                self.mark_truncated();
+                bail!("truncated GRE key");
+            }
+            gre_key = u32::from_be_bytes([
+                gre[offset],
+                gre[offset + 1],
+                gre[offset + 2],
+                gre[offset + 3],
+            ]) as u64;
             offset += 4;
         }
         if flags & 0x1000 != 0 {
@@ -551,12 +599,20 @@ impl PacketDecoder {
             // Source-route entries: AF(2), offset(1), len(1), payload(len),
             // terminated by AF=0,len=0. This is tunnel slow-path only.
             loop {
-                if offset + 4 > gre.len() { self.mark_truncated(); bail!("truncated GRE routing entry"); }
-                let af = u16::from_be_bytes([gre[offset], gre[offset+1]]);
-                let len = gre[offset+3] as usize;
+                if offset + 4 > gre.len() {
+                    self.mark_truncated();
+                    bail!("truncated GRE routing entry");
+                }
+                let af = u16::from_be_bytes([gre[offset], gre[offset + 1]]);
+                let len = gre[offset + 3] as usize;
                 offset += 4;
-                if af == 0 && len == 0 { break; }
-                if offset + len > gre.len() { self.mark_truncated(); bail!("truncated GRE routing data"); }
+                if af == 0 && len == 0 {
+                    break;
+                }
+                if offset + len > gre.len() {
+                    self.mark_truncated();
+                    bail!("truncated GRE routing data");
+                }
                 offset += len;
             }
         }
@@ -577,51 +633,57 @@ impl PacketDecoder {
     #[inline]
     fn mark_truncated(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.capture_truncated_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .capture_truncated_packets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     #[inline]
     fn fragment_received(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.ip_fragments_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .ip_fragments_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     #[inline]
     fn fragment_reassembled(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.ip_fragments_reassembled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .ip_fragments_reassembled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     #[inline]
     fn fragment_overlap_drop(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.ip_fragment_overlap_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .ip_fragment_overlap_drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     fn apply_fragment_maintenance(&self, maintenance: super::fragment::FragmentMaintenance) {
         if let Some(metrics) = &self.metrics {
             if maintenance.expired != 0 {
-                metrics.ip_fragment_expired.fetch_add(maintenance.expired, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .ip_fragment_expired
+                    .fetch_add(maintenance.expired, std::sync::atomic::Ordering::Relaxed);
             }
             if maintenance.evicted != 0 {
-                metrics.ip_fragment_evicted.fetch_add(maintenance.evicted, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .ip_fragment_evicted
+                    .fetch_add(maintenance.evicted, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
 }
 
 #[inline]
-fn mix_tunnel_domain(
-    mut domain: u64,
-    kind: u64,
-    src: IpAddr,
-    dst: IpAddr,
-    id: u64,
-) -> u64 {
+fn mix_tunnel_domain(mut domain: u64, kind: u64, src: IpAddr, dst: IpAddr, id: u64) -> u64 {
     // Tunnel identity must be direction-independent so inner packets from both
     // directions land in one FlowKey, while separate outer tunnels cannot mix
     // identical inner 4-tuples. This runs only on decapsulation slow paths.
@@ -657,9 +719,17 @@ fn mix_domain(domain: u64, kind: u64, value: u64) -> u64 {
 /// Compatibility helper used by unit tests and external callers. Stateful IP
 /// fragmentation requires `PacketDecoder`; this helper parses one standalone
 /// frame and returns `None` while a fragmented datagram would be incomplete.
-pub fn parse_ethernet_frame(ts_ns: u64, wire_len: usize, frame: Bytes) -> Result<Option<ParsedPacket>> {
+pub fn parse_ethernet_frame(
+    ts_ns: u64,
+    wire_len: usize,
+    frame: Bytes,
+) -> Result<Option<ParsedPacket>> {
     let mut decoder = PacketDecoder::stateless();
-    let captured = CapturedFrame { ts_ns, wire_len, data: frame };
+    let captured = CapturedFrame {
+        ts_ns,
+        wire_len,
+        data: frame,
+    };
     Ok(match decoder.decode(captured)? {
         DecodeOutcome::Packet(packet) => Some(packet),
         DecodeOutcome::PendingFragment | DecodeOutcome::Ignored => None,
@@ -708,7 +778,6 @@ mod tests {
         assert!(parse_ethernet_frame(1, full.len(), truncated).is_err());
     }
 
-
     fn ipv4_fragment(id: u16, offset_bytes: usize, more: bool, payload: &[u8]) -> Bytes {
         assert_eq!(offset_bytes % 8, 0);
         let total = 14 + 20 + payload.len();
@@ -719,7 +788,9 @@ mod tests {
         f[ip + 2..ip + 4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
         f[ip + 4..ip + 6].copy_from_slice(&id.to_be_bytes());
         let mut frag = (offset_bytes / 8) as u16;
-        if more { frag |= 0x2000; }
+        if more {
+            frag |= 0x2000;
+        }
         f[ip + 6..ip + 8].copy_from_slice(&frag.to_be_bytes());
         f[ip + 8] = 64;
         f[ip + 9] = 6;
@@ -751,11 +822,14 @@ mod tests {
         f[ip + 6] = 44;
         f[ip + 7] = 64;
         f[ip + 8..ip + 24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        f[ip + 24..ip + 40].copy_from_slice(&Ipv6Addr::new(0x2001,0xdb8,0,0,0,0,0,2).octets());
+        f[ip + 24..ip + 40]
+            .copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
         let fh = ip + 40;
         f[fh] = 6;
         let mut off_field = offset_bytes as u16;
-        if more { off_field |= 1; }
+        if more {
+            off_field |= 1;
+        }
         f[fh + 2..fh + 4].copy_from_slice(&off_field.to_be_bytes());
         f[fh + 4..fh + 8].copy_from_slice(&id.to_be_bytes());
         f[fh + 8..].copy_from_slice(payload);
@@ -769,10 +843,24 @@ mod tests {
         let first = ipv4_fragment(0x1234, 0, true, &tcp[..24]);
         let last = ipv4_fragment(0x1234, 24, false, &tcp[24..]);
         let mut decoder = PacketDecoder::stateless();
-        let r1 = decoder.decode(CapturedFrame { ts_ns: 1, wire_len: last.len(), data: last }).unwrap();
+        let r1 = decoder
+            .decode(CapturedFrame {
+                ts_ns: 1,
+                wire_len: last.len(),
+                data: last,
+            })
+            .unwrap();
         assert!(matches!(r1, DecodeOutcome::PendingFragment));
-        let r2 = decoder.decode(CapturedFrame { ts_ns: 2, wire_len: first.len(), data: first }).unwrap();
-        let DecodeOutcome::Packet(packet) = r2 else { panic!("ipv4 fragments did not reassemble"); };
+        let r2 = decoder
+            .decode(CapturedFrame {
+                ts_ns: 2,
+                wire_len: first.len(),
+                data: first,
+            })
+            .unwrap();
+        let DecodeOutcome::Packet(packet) = r2 else {
+            panic!("ipv4 fragments did not reassemble");
+        };
         assert_eq!(packet.seq, Some(77));
         assert_eq!(packet.payload.as_ref(), b"abcdefghijkl");
     }
@@ -783,10 +871,24 @@ mod tests {
         let first = ipv6_fragment(0x11223344, 0, true, &tcp[..24]);
         let last = ipv6_fragment(0x11223344, 24, false, &tcp[24..]);
         let mut decoder = PacketDecoder::stateless();
-        let r1 = decoder.decode(CapturedFrame { ts_ns: 1, wire_len: last.len(), data: last }).unwrap();
+        let r1 = decoder
+            .decode(CapturedFrame {
+                ts_ns: 1,
+                wire_len: last.len(),
+                data: last,
+            })
+            .unwrap();
         assert!(matches!(r1, DecodeOutcome::PendingFragment));
-        let r2 = decoder.decode(CapturedFrame { ts_ns: 2, wire_len: first.len(), data: first }).unwrap();
-        let DecodeOutcome::Packet(packet) = r2 else { panic!("ipv6 fragments did not reassemble"); };
+        let r2 = decoder
+            .decode(CapturedFrame {
+                ts_ns: 2,
+                wire_len: first.len(),
+                data: first,
+            })
+            .unwrap();
+        let DecodeOutcome::Packet(packet) = r2 else {
+            panic!("ipv6 fragments did not reassemble");
+        };
         assert_eq!(packet.seq, Some(88));
         assert_eq!(packet.payload.as_ref(), b"abcdefghijkl");
     }
@@ -826,7 +928,9 @@ mod tests {
         outer[vx + 4..vx + 7].copy_from_slice(&[0x01, 0x02, 0x03]);
         outer[vx + 8..].copy_from_slice(&inner);
 
-        let packet = parse_ethernet_frame(1, total, Bytes::from(outer)).unwrap().unwrap();
+        let packet = parse_ethernet_frame(1, total, Bytes::from(outer))
+            .unwrap()
+            .unwrap();
         assert_eq!(packet.seq, Some(321));
         assert_eq!(packet.payload.as_ref(), b"vxlan");
         assert_ne!(packet.key.l2_domain, 0);
@@ -841,8 +945,12 @@ mod tests {
         tagged.extend_from_slice(&100u16.to_be_bytes());
         tagged.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
         tagged.extend_from_slice(&plain[14..]);
-        let a = parse_ethernet_frame(1, plain.len(), plain).unwrap().unwrap();
-        let b = parse_ethernet_frame(1, tagged.len(), Bytes::from(tagged)).unwrap().unwrap();
+        let a = parse_ethernet_frame(1, plain.len(), plain)
+            .unwrap()
+            .unwrap();
+        let b = parse_ethernet_frame(1, tagged.len(), Bytes::from(tagged))
+            .unwrap()
+            .unwrap();
         assert_ne!(a.key.l2_domain, b.key.l2_domain);
     }
 }

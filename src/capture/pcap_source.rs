@@ -29,7 +29,9 @@ impl PcapLiveSource {
 
 impl FrameSource for PcapLiveSource {
     fn configure_port_filter(&mut self, ports: &[u16], extra: Option<&str>) -> Result<()> {
-        self.cap.filter(&port_filter_expression(ports, extra), true).context("install dynamic live BPF filter")
+        self.cap
+            .filter(&port_filter_expression(ports, extra), true)
+            .context("install dynamic live BPF filter")
     }
 
     fn receive_batch(&mut self, max: usize, out: &mut Vec<CapturedFrame>) -> Result<usize> {
@@ -69,13 +71,18 @@ impl PcapFileSource {
     pub fn open(cfg: &Config) -> Result<Self> {
         let path = cfg.pcap_file.as_ref().context("missing pcap file")?;
         let cap = Capture::from_file(path).with_context(|| format!("open {}", path.display()))?;
-        Ok(Self { cap, exhausted: false })
+        Ok(Self {
+            cap,
+            exhausted: false,
+        })
     }
 }
 
 impl FrameSource for PcapFileSource {
     fn configure_port_filter(&mut self, ports: &[u16], extra: Option<&str>) -> Result<()> {
-        self.cap.filter(&port_filter_expression(ports, extra), true).context("install dynamic offline BPF filter")
+        self.cap
+            .filter(&port_filter_expression(ports, extra), true)
+            .context("install dynamic offline BPF filter")
     }
 
     fn receive_batch(&mut self, max: usize, out: &mut Vec<CapturedFrame>) -> Result<usize> {
@@ -113,7 +120,11 @@ fn port_filter_expression(ports: &[u16], extra: Option<&str>) -> String {
         // fragment/tunnel bypass clauses become an unauthenticated work source.
         return "ip and not ip".to_owned();
     }
-    let ports_expr = ports.iter().map(|p| format!("port {p}")).collect::<Vec<_>>().join(" or ");
+    let ports_expr = ports
+        .iter()
+        .map(|p| format!("port {p}"))
+        .collect::<Vec<_>>()
+        .join(" or ");
 
     // Non-first fragments do not contain TCP/UDP ports. If early BPF is
     // enabled, explicitly admit IPv4 fragments and IPv6 fragment-header
@@ -136,7 +147,9 @@ fn port_filter_expression(ports: &[u16], extra: Option<&str>) -> String {
         // A custom expression such as `tcp` cannot be evaluated on non-first
         // fragments or on an encapsulated inner packet. Apply it only to the
         // normal service-port clause.
-        Some(extra) => format!("(({ports_expr}) and ({extra})) or {fragments_expr} or {tunnels_expr} or {tagged_expr}"),
+        Some(extra) => format!(
+            "(({ports_expr}) and ({extra})) or {fragments_expr} or {tunnels_expr} or {tagged_expr}"
+        ),
         None => format!("({ports_expr}) or {fragments_expr} or {tunnels_expr} or {tagged_expr}"),
     }
 }

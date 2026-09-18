@@ -3,7 +3,7 @@
 
 This is intentionally independent from static_verify.py: it checks that fixes
 for adversarial/reordered traffic remain off the dominant in-order path and
-that all slow-path state is bounded by both bytes and object counts.
+that the covered slow-path state is bounded by both bytes and object counts.
 """
 from pathlib import Path
 
@@ -14,10 +14,12 @@ def text(path: str) -> str:
 
 reasm = text("src/flow/reassembly.rs")
 flow = text("src/flow/mod.rs")
+flow_prod = flow.split("#[cfg(test)]", 1)[0]
 parser = text("src/capture/parser.rs")
 frag = text("src/capture/fragment.rs")
 capture = text("src/capture/mod.rs")
 http = text("src/http/mod.rs")
+matching = text("src/matching/mod.rs")
 config = text("src/config.rs")
 model = text("src/model.rs")
 pcap_source = text("src/capture/pcap_source.rs")
@@ -42,6 +44,23 @@ assert "gap_started_ts_ns" in reasm and "recover_ooo_timeout" in reasm
 assert "pub fn finalize" in reasm
 assert 'parse_env("PACKMATE_MAX_OOO_SEGMENTS", 8192usize)' in config
 assert "pending_fin_requires_ack" in reasm
+
+# Global flow admission is checked only when a tuple is not already present;
+# established/in-order packet processing does not take a global lock/CAS.
+assert "Entry::Occupied(entry) => (entry.into_mut(), false)" in flow_prod
+assert "Entry::Vacant(entry)" in flow_prod
+assert "if !try_admit_flow(&metrics, cfg.max_active_flows)" in flow_prod
+assert flow_prod.count("try_admit_flow(&metrics") == 1
+assert "fetch_update(Ordering::Relaxed" in flow_prod
+
+# Match fanout limits live on the positive-match slow path. A record with no
+# matching candidate allocates no per-pattern entries; repetitive candidates
+# stop once the total candidate budget is exhausted.
+assert "struct MatchLimiter" in matching
+assert "per_pattern: AHashMap" in matching
+assert "self.candidates += 1" in matching
+assert "if limiter.exhausted()" in matching
+assert "scan_bounded" in matching
 
 # IP fragments are the only packets that enter the shared sharded cache.
 frag_branch = parser.split("if offset != 0 || more {", 1)[1].split("self.decode_ip_payload", 1)[0]
@@ -69,4 +88,4 @@ assert "SkipFixed" in http
 assert "max_collect" in http
 assert "Waiting for the complete request-target/version" in http
 
-print("HOTPATH PASS: v0.4 common paths stay zero-copy/unlocked; fragment/OOO/HTTP slow paths are bounded")
+print("HOTPATH PASS: v0.4 common paths stay zero-copy/unlocked; fragment/OOO/HTTP plus new-flow/match amplification slow paths are bounded")

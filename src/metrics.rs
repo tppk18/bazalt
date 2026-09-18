@@ -2,11 +2,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 #[derive(Debug, Default)]
 pub struct Metrics {
+    /// Wall-clock nanoseconds of the last successful stage-loop observation.
+    /// This is a liveness signal only; traffic timestamps never use it.
+    pub pipeline_last_progress_ns: AtomicU64,
     pub capture_frames: AtomicU64,
     pub capture_frame_bytes: AtomicU64,
     pub packets_received: AtomicU64,
@@ -33,10 +37,18 @@ pub struct Metrics {
     pub match_queue_depth: AtomicU64,
     pub match_queue_capacity: AtomicU64,
     pub match_queue_high_watermark: AtomicU64,
+    pub matcher_queue_drops: AtomicU64,
     pub storage_queue_depth: AtomicU64,
     pub storage_queue_capacity: AtomicU64,
     pub storage_queue_high_watermark: AtomicU64,
+    pub segment_queue_depth: AtomicU64,
+    pub segment_queue_capacity: AtomicU64,
+    pub segment_queue_high_watermark: AtomicU64,
+    pub metadata_spool_bytes: AtomicU64,
+    pub metadata_spool_capacity: AtomicU64,
     pub active_flows: AtomicU64,
+    pub flow_state_rejections: AtomicU64,
+    pub flow_prefix_rejections: AtomicU64,
     pub flows_completed: AtomicU64,
     pub tcp_retransmits: AtomicU64,
     pub tcp_out_of_order: AtomicU64,
@@ -48,7 +60,10 @@ pub struct Metrics {
     pub http_parse_errors: AtomicU64,
     pub matcher_bytes: AtomicU64,
     pub matcher_matches: AtomicU64,
+    pub matcher_match_limit_events: AtomicU64,
     pub segment_bytes: AtomicU64,
+    pub segment_disk_bytes: AtomicU64,
+    pub segment_disk_capacity: AtomicU64,
     pub replay_bytes: AtomicU64,
     pub replay_matches: AtomicU64,
     pub replay_active: AtomicU64,
@@ -67,6 +82,27 @@ impl Metrics {
         Arc::new(Self::default())
     }
 
+    pub fn touch_progress(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        self.pipeline_last_progress_ns.store(now, Ordering::Release);
+    }
+
+    pub fn progress_stale(&self, timeout: std::time::Duration) -> bool {
+        let last = self.pipeline_last_progress_ns.load(Ordering::Acquire);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        now.saturating_sub(last as u128) > timeout.as_nanos()
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         macro_rules! load {
             ($f:ident) => {
@@ -74,6 +110,7 @@ impl Metrics {
             };
         }
         MetricsSnapshot {
+            pipeline_last_progress_ns: load!(pipeline_last_progress_ns),
             capture_frames: load!(capture_frames),
             capture_frame_bytes: load!(capture_frame_bytes),
             packets_received: load!(packets_received),
@@ -100,10 +137,18 @@ impl Metrics {
             match_queue_depth: load!(match_queue_depth),
             match_queue_capacity: load!(match_queue_capacity),
             match_queue_high_watermark: load!(match_queue_high_watermark),
+            matcher_queue_drops: load!(matcher_queue_drops),
             storage_queue_depth: load!(storage_queue_depth),
             storage_queue_capacity: load!(storage_queue_capacity),
             storage_queue_high_watermark: load!(storage_queue_high_watermark),
+            segment_queue_depth: load!(segment_queue_depth),
+            segment_queue_capacity: load!(segment_queue_capacity),
+            segment_queue_high_watermark: load!(segment_queue_high_watermark),
+            metadata_spool_bytes: load!(metadata_spool_bytes),
+            metadata_spool_capacity: load!(metadata_spool_capacity),
             active_flows: load!(active_flows),
+            flow_state_rejections: load!(flow_state_rejections),
+            flow_prefix_rejections: load!(flow_prefix_rejections),
             flows_completed: load!(flows_completed),
             tcp_retransmits: load!(tcp_retransmits),
             tcp_out_of_order: load!(tcp_out_of_order),
@@ -115,7 +160,10 @@ impl Metrics {
             http_parse_errors: load!(http_parse_errors),
             matcher_bytes: load!(matcher_bytes),
             matcher_matches: load!(matcher_matches),
+            matcher_match_limit_events: load!(matcher_match_limit_events),
             segment_bytes: load!(segment_bytes),
+            segment_disk_bytes: load!(segment_disk_bytes),
+            segment_disk_capacity: load!(segment_disk_capacity),
             replay_bytes: load!(replay_bytes),
             replay_matches: load!(replay_matches),
             replay_active: load!(replay_active),
@@ -145,7 +193,9 @@ impl Metrics {
     }
 
     pub fn queue_dequeued(depth: &AtomicU64) {
-        let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_sub(1)));
+        let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_sub(1))
+        });
     }
 
     pub fn prometheus(&self) -> String {
@@ -160,47 +210,137 @@ impl Metrics {
             }};
         }
         metric!("capture_frames_total", s.capture_frames, "counter");
-        metric!("capture_frame_bytes_total", s.capture_frame_bytes, "counter");
+        metric!(
+            "capture_frame_bytes_total",
+            s.capture_frame_bytes,
+            "counter"
+        );
         metric!("packets_received_total", s.packets_received, "counter");
         metric!("packet_bytes_total", s.packet_bytes, "counter");
-        metric!("packet_parse_errors_total", s.packet_parse_errors, "counter");
-        metric!("capture_truncated_packets_total", s.capture_truncated_packets, "counter");
-        metric!("ip_fragments_received_total", s.ip_fragments_received, "counter");
-        metric!("ip_fragments_reassembled_total", s.ip_fragments_reassembled, "counter");
-        metric!("ip_fragment_overlap_drops_total", s.ip_fragment_overlap_drops, "counter");
-        metric!("ip_fragment_expired_total", s.ip_fragment_expired, "counter");
-        metric!("ip_fragment_evicted_total", s.ip_fragment_evicted, "counter");
+        metric!(
+            "packet_parse_errors_total",
+            s.packet_parse_errors,
+            "counter"
+        );
+        metric!(
+            "capture_truncated_packets_total",
+            s.capture_truncated_packets,
+            "counter"
+        );
+        metric!(
+            "ip_fragments_received_total",
+            s.ip_fragments_received,
+            "counter"
+        );
+        metric!(
+            "ip_fragments_reassembled_total",
+            s.ip_fragments_reassembled,
+            "counter"
+        );
+        metric!(
+            "ip_fragment_overlap_drops_total",
+            s.ip_fragment_overlap_drops,
+            "counter"
+        );
+        metric!(
+            "ip_fragment_expired_total",
+            s.ip_fragment_expired,
+            "counter"
+        );
+        metric!(
+            "ip_fragment_evicted_total",
+            s.ip_fragment_evicted,
+            "counter"
+        );
         metric!("packets_ignored_total", s.packets_ignored, "counter");
         metric!("packets_filtered_total", s.packets_filtered, "counter");
         metric!("capture_drops_total", s.capture_drops, "counter");
-        metric!("capture_backend_drops_total", s.capture_backend_drops, "counter");
-        metric!("capture_backend_invalid_descs_total", s.capture_backend_invalid_descs, "counter");
+        metric!(
+            "capture_backend_drops_total",
+            s.capture_backend_drops,
+            "counter"
+        );
+        metric!(
+            "capture_backend_invalid_descs_total",
+            s.capture_backend_invalid_descs,
+            "counter"
+        );
         metric!("raw_capture_drops_total", s.raw_capture_drops, "counter");
         metric!("flow_queue_depth", s.flow_queue_depth, "gauge");
         metric!("flow_queue_capacity", s.flow_queue_capacity, "gauge");
-        metric!("flow_queue_high_watermark", s.flow_queue_high_watermark, "gauge");
+        metric!(
+            "flow_queue_high_watermark",
+            s.flow_queue_high_watermark,
+            "gauge"
+        );
         metric!("l7_queue_depth", s.l7_queue_depth, "gauge");
         metric!("l7_queue_capacity", s.l7_queue_capacity, "gauge");
-        metric!("l7_queue_high_watermark", s.l7_queue_high_watermark, "gauge");
+        metric!(
+            "l7_queue_high_watermark",
+            s.l7_queue_high_watermark,
+            "gauge"
+        );
         metric!("match_queue_depth", s.match_queue_depth, "gauge");
         metric!("match_queue_capacity", s.match_queue_capacity, "gauge");
-        metric!("match_queue_high_watermark", s.match_queue_high_watermark, "gauge");
+        metric!(
+            "match_queue_high_watermark",
+            s.match_queue_high_watermark,
+            "gauge"
+        );
+        metric!(
+            "matcher_queue_drops_total",
+            s.matcher_queue_drops,
+            "counter"
+        );
         metric!("storage_queue_depth", s.storage_queue_depth, "gauge");
         metric!("storage_queue_capacity", s.storage_queue_capacity, "gauge");
-        metric!("storage_queue_high_watermark", s.storage_queue_high_watermark, "gauge");
+        metric!(
+            "storage_queue_high_watermark",
+            s.storage_queue_high_watermark,
+            "gauge"
+        );
+        metric!("segment_queue_depth", s.segment_queue_depth, "gauge");
+        metric!("segment_queue_capacity", s.segment_queue_capacity, "gauge");
+        metric!(
+            "segment_queue_high_watermark",
+            s.segment_queue_high_watermark,
+            "gauge"
+        );
+        metric!("metadata_spool_bytes", s.metadata_spool_bytes, "gauge");
+        metric!(
+            "metadata_spool_capacity",
+            s.metadata_spool_capacity,
+            "gauge"
+        );
         metric!("active_flows", s.active_flows, "gauge");
+        metric!(
+            "flow_state_rejections_total",
+            s.flow_state_rejections,
+            "counter"
+        );
         metric!("flows_completed_total", s.flows_completed, "counter");
         metric!("tcp_retransmits_total", s.tcp_retransmits, "counter");
         metric!("tcp_out_of_order_total", s.tcp_out_of_order, "counter");
         metric!("tcp_gap_events_total", s.tcp_gap_events, "counter");
         metric!("tcp_gap_bytes_total", s.tcp_gap_bytes, "counter");
-        metric!("tcp_rejected_resets_total", s.tcp_rejected_resets, "counter");
+        metric!(
+            "tcp_rejected_resets_total",
+            s.tcp_rejected_resets,
+            "counter"
+        );
         metric!("http_requests_total", s.http_requests, "counter");
         metric!("http_responses_total", s.http_responses, "counter");
         metric!("http_parse_errors_total", s.http_parse_errors, "counter");
         metric!("matcher_bytes_total", s.matcher_bytes, "counter");
         metric!("matcher_matches_total", s.matcher_matches, "counter");
+        metric!(
+            "matcher_match_limit_events_total",
+            s.matcher_match_limit_events,
+            "counter"
+        );
         metric!("segment_bytes_total", s.segment_bytes, "counter");
+        metric!("segment_disk_bytes", s.segment_disk_bytes, "gauge");
+        metric!("segment_disk_capacity", s.segment_disk_capacity, "gauge");
         metric!("replay_bytes_total", s.replay_bytes, "counter");
         metric!("replay_matches_total", s.replay_matches, "counter");
         metric!("replay_active", s.replay_active, "gauge");
@@ -234,6 +374,14 @@ impl Metrics {
                 self.storage_queue_depth.load(Ordering::Relaxed),
                 self.storage_queue_capacity.load(Ordering::Relaxed),
             ),
+            (
+                self.segment_queue_depth.load(Ordering::Relaxed),
+                self.segment_queue_capacity.load(Ordering::Relaxed),
+            ),
+            (
+                self.metadata_spool_bytes.load(Ordering::Relaxed),
+                self.metadata_spool_capacity.load(Ordering::Relaxed),
+            ),
         ];
         pairs
             .into_iter()
@@ -244,8 +392,23 @@ impl Metrics {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn live_pressure_accounts_for_segment_queue() {
+        let metrics = Metrics::default();
+        metrics.segment_queue_capacity.store(10, Ordering::Relaxed);
+        metrics.segment_queue_depth.store(8, Ordering::Relaxed);
+        assert_eq!(metrics.live_pressure_pct(), 80);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct MetricsSnapshot {
+    pub pipeline_last_progress_ns: u64,
     pub capture_frames: u64,
     pub capture_frame_bytes: u64,
     pub packets_received: u64,
@@ -272,10 +435,18 @@ pub struct MetricsSnapshot {
     pub match_queue_depth: u64,
     pub match_queue_capacity: u64,
     pub match_queue_high_watermark: u64,
+    pub matcher_queue_drops: u64,
     pub storage_queue_depth: u64,
     pub storage_queue_capacity: u64,
     pub storage_queue_high_watermark: u64,
+    pub segment_queue_depth: u64,
+    pub segment_queue_capacity: u64,
+    pub segment_queue_high_watermark: u64,
+    pub metadata_spool_bytes: u64,
+    pub metadata_spool_capacity: u64,
     pub active_flows: u64,
+    pub flow_state_rejections: u64,
+    pub flow_prefix_rejections: u64,
     pub flows_completed: u64,
     pub tcp_retransmits: u64,
     pub tcp_out_of_order: u64,
@@ -287,7 +458,10 @@ pub struct MetricsSnapshot {
     pub http_parse_errors: u64,
     pub matcher_bytes: u64,
     pub matcher_matches: u64,
+    pub matcher_match_limit_events: u64,
     pub segment_bytes: u64,
+    pub segment_disk_bytes: u64,
+    pub segment_disk_capacity: u64,
     pub replay_bytes: u64,
     pub replay_matches: u64,
     pub replay_active: u64,

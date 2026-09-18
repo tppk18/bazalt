@@ -2,7 +2,8 @@ mod reassembly;
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{hash_map::Entry, BinaryHeap, VecDeque},
+    net::IpAddr,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -17,11 +18,12 @@ use crate::{
     config::Config,
     http::L7Ingress,
     metrics::Metrics,
-    model::{Direction, FlowKey, FlowOutput, FlowSummary, ParsedPacket, StreamChunk, TransportProtocol},
+    model::{
+        Direction, FlowKey, FlowOutput, FlowSummary, ParsedPacket, StreamChunk, TransportProtocol,
+    },
 };
 
 use reassembly::TcpHalf;
-
 
 const TCP_TOMBSTONE_TTL: Duration = Duration::from_secs(2);
 const TCP_TOMBSTONE_MAX: usize = 65_536;
@@ -37,7 +39,10 @@ struct TcpTombstones {
 
 impl TcpTombstones {
     fn new() -> Self {
-        Self { by_key: AHashMap::new(), order: VecDeque::new() }
+        Self {
+            by_key: AHashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
     fn contains_live(&mut self, key: &FlowKey, now: Instant) -> bool {
@@ -55,17 +60,31 @@ impl TcpTombstones {
         self.order.push_back((deadline, key));
         self.expire(now);
         while self.by_key.len() > TCP_TOMBSTONE_MAX {
-            let Some((deadline, key)) = self.order.pop_front() else { break; };
-            if self.by_key.get(&key).is_some_and(|current| *current == deadline) {
+            let Some((deadline, key)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .by_key
+                .get(&key)
+                .is_some_and(|current| *current == deadline)
+            {
                 self.by_key.remove(&key);
             }
         }
     }
 
     fn expire(&mut self, now: Instant) {
-        while self.order.front().is_some_and(|(deadline, _)| *deadline <= now) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
             let (deadline, key) = self.order.pop_front().expect("front exists");
-            if self.by_key.get(&key).is_some_and(|current| *current == deadline) {
+            if self
+                .by_key
+                .get(&key)
+                .is_some_and(|current| *current == deadline)
+            {
                 self.by_key.remove(&key);
             }
         }
@@ -80,11 +99,18 @@ pub struct FlowIngress {
 }
 
 impl FlowIngress {
-    pub fn send_timeout(&self, packet: ParsedPacket, timeout: Duration) -> Result<usize, SendTimeoutError<ParsedPacket>> {
+    pub fn send_timeout(
+        &self,
+        packet: ParsedPacket,
+        timeout: Duration,
+    ) -> Result<usize, SendTimeoutError<ParsedPacket>> {
         let idx = (packet.key.shard_hash64(self.shard_seed) as usize) % self.shard_txs.len();
         let tx = &self.shard_txs[idx];
         tx.send_timeout(packet, timeout)?;
-        Ok(Metrics::queue_enqueued(&self.metrics.flow_queue_depth, &self.metrics.flow_queue_high_watermark) as usize)
+        Ok(Metrics::queue_enqueued(
+            &self.metrics.flow_queue_depth,
+            &self.metrics.flow_queue_high_watermark,
+        ) as usize)
     }
 }
 
@@ -96,7 +122,10 @@ pub struct FlowRuntime {
 impl FlowRuntime {
     pub fn spawn(cfg: Arc<Config>, metrics: Arc<Metrics>, l7: L7Ingress) -> anyhow::Result<Self> {
         let per_shard_capacity = (cfg.capture_to_flow_capacity / cfg.flow_shards.max(1)).max(1);
-        metrics.flow_queue_capacity.store((per_shard_capacity * cfg.flow_shards.max(1)) as u64, Ordering::Relaxed);
+        metrics.flow_queue_capacity.store(
+            (per_shard_capacity * cfg.flow_shards.max(1)) as u64,
+            Ordering::Relaxed,
+        );
 
         let mut shard_txs = Vec::with_capacity(cfg.flow_shards);
         let mut handles = Vec::with_capacity(cfg.flow_shards);
@@ -106,7 +135,11 @@ impl FlowRuntime {
             let cfg2 = cfg.clone();
             let metrics2 = metrics.clone();
             let out2 = l7.clone();
-            let flow_cpu = if cfg.flow_cpus.is_empty() { None } else { Some(cfg.flow_cpus[shard_id % cfg.flow_cpus.len()]) };
+            let flow_cpu = if cfg.flow_cpus.is_empty() {
+                None
+            } else {
+                Some(cfg.flow_cpus[shard_id % cfg.flow_cpus.len()])
+            };
             handles.push(std::thread::Builder::new()
                 .name(format!("flow-shard-{shard_id}"))
                 .spawn(move || {
@@ -126,7 +159,11 @@ impl FlowRuntime {
         let shard_seed = u64::from_le_bytes(seed_bytes[0..8].try_into().expect("8 byte UUID half"))
             ^ u64::from_le_bytes(seed_bytes[8..16].try_into().expect("8 byte UUID half"));
         Ok(Self {
-            input: FlowIngress { shard_txs: Arc::new(shard_txs), shard_seed, metrics },
+            input: FlowIngress {
+                shard_txs: Arc::new(shard_txs),
+                shard_seed,
+                metrics,
+            },
             handles,
         })
     }
@@ -135,13 +172,21 @@ impl FlowRuntime {
         self.handles.len()
     }
 
+    pub fn critical_worker_finished(&self) -> bool {
+        self.handles
+            .iter()
+            .any(std::thread::JoinHandle::is_finished)
+    }
+
     /// Stop accepting packets and drain all shard queues. Capture workers must
     /// be joined first so they no longer hold FlowIngress clones.
     pub fn shutdown_and_join(self) -> anyhow::Result<()> {
         let FlowRuntime { input, handles } = self;
         drop(input);
         for handle in handles {
-            handle.join().map_err(|_| anyhow::anyhow!("flow worker panicked"))?;
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("flow worker panicked"))?;
         }
         Ok(())
     }
@@ -151,6 +196,7 @@ struct FlowState {
     id: Uuid,
     key: FlowKey,
     initiator: Direction,
+    source_prefix: SourcePrefix,
     started_ns: u64,
     last_seen_ns: u64,
     last_activity: Instant,
@@ -176,6 +222,7 @@ impl FlowState {
             // starts a new FlowState, making this the TCP initiator in the
             // normal capture case.
             initiator: packet.direction,
+            source_prefix: SourcePrefix::from_packet(packet),
             started_ns: packet.ts_ns,
             last_seen_ns: packet.ts_ns,
             last_activity: Instant::now(),
@@ -234,14 +281,20 @@ impl FlowState {
     fn summary(&self) -> FlowSummary {
         let (src, dst, packets_c2s, packets_s2c, bytes_c2s, bytes_s2c) = match self.initiator {
             Direction::AToB => (
-                &self.key.a, &self.key.b,
-                self.packets_a_to_b, self.packets_b_to_a,
-                self.bytes_a_to_b, self.bytes_b_to_a,
+                &self.key.a,
+                &self.key.b,
+                self.packets_a_to_b,
+                self.packets_b_to_a,
+                self.bytes_a_to_b,
+                self.bytes_b_to_a,
             ),
             Direction::BToA => (
-                &self.key.b, &self.key.a,
-                self.packets_b_to_a, self.packets_a_to_b,
-                self.bytes_b_to_a, self.bytes_a_to_b,
+                &self.key.b,
+                &self.key.a,
+                self.packets_b_to_a,
+                self.packets_a_to_b,
+                self.bytes_b_to_a,
+                self.bytes_a_to_b,
             ),
         };
         FlowSummary {
@@ -263,6 +316,25 @@ impl FlowState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SourcePrefix {
+    V4(u32),
+    V6([u8; 8]),
+}
+
+impl SourcePrefix {
+    fn from_packet(packet: &ParsedPacket) -> Self {
+        let source = match packet.direction {
+            Direction::AToB => &packet.key.a.ip,
+            Direction::BToA => &packet.key.b.ip,
+        };
+        match source {
+            IpAddr::V4(ip) => Self::V4(u32::from_be_bytes(ip.octets()) >> 8),
+            IpAddr::V6(ip) => Self::V6(ip.octets()[..8].try_into().expect("IPv6 /64 prefix")),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TimerItem {
     deadline: Instant,
@@ -272,16 +344,23 @@ struct TimerItem {
 }
 
 impl PartialEq for TimerItem {
-    fn eq(&self, other: &Self) -> bool { self.deadline == other.deadline && self.serial == other.serial }
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.serial == other.serial
+    }
 }
 impl Eq for TimerItem {}
 impl PartialOrd for TimerItem {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for TimerItem {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         // Reverse ordering so BinaryHeap acts as a min-heap.
-        other.deadline.cmp(&self.deadline).then_with(|| other.serial.cmp(&self.serial))
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.serial.cmp(&self.serial))
     }
 }
 
@@ -295,12 +374,14 @@ fn shard_loop(
     let mut flows: AHashMap<FlowKey, FlowState> = AHashMap::new();
     let mut tombstones = TcpTombstones::new();
     let mut timers = BinaryHeap::<TimerItem>::new();
+    let mut source_counts: AHashMap<SourcePrefix, usize> = AHashMap::new();
     let mut serial = 0u64;
     let tcp_gap_timeout_ns = cfg.tcp_gap_timeout.as_nanos().min(u64::MAX as u128) as u64;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(mut packet) => {
+                metrics.touch_progress();
                 Metrics::queue_dequeued(&metrics.flow_queue_depth);
                 let key = packet.key.clone();
 
@@ -329,18 +410,43 @@ fn shard_loop(
                     && packet.flags.syn
                     && !packet.flags.ack
                 {
-                    let new_generation = flows.get(&key)
+                    let new_generation = flows
+                        .get(&key)
                         .map(|existing| !existing.is_syn_retransmit(&packet))
                         .unwrap_or(false);
                     if new_generation {
-                        close_flow(&mut flows, &key, &output, &metrics, shard_id);
+                        close_flow(
+                            &mut flows,
+                            &key,
+                            &output,
+                            &metrics,
+                            shard_id,
+                            &mut source_counts,
+                        );
                     }
                 }
-                let is_new_flow = !flows.contains_key(&key);
-                let state = flows.entry(key.clone()).or_insert_with(|| {
-                    metrics.active_flows.fetch_add(1, Ordering::Relaxed);
-                    FlowState::new(&packet)
-                });
+                let (state, is_new_flow) = match flows.entry(key.clone()) {
+                    Entry::Occupied(entry) => (entry.into_mut(), false),
+                    Entry::Vacant(entry) => {
+                        if !try_admit_flow(&metrics, cfg.max_active_flows) {
+                            metrics
+                                .flow_state_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let source = SourcePrefix::from_packet(&packet);
+                        let count = source_counts.entry(source).or_default();
+                        if *count >= cfg.max_flows_per_source_prefix {
+                            metrics.active_flows.fetch_sub(1, Ordering::Relaxed);
+                            metrics
+                                .flow_prefix_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        *count += 1;
+                        (entry.insert(FlowState::new(&packet)), true)
+                    }
+                };
                 state.count_packet(&packet);
 
                 let mut emitted_content = false;
@@ -372,7 +478,11 @@ fn shard_loop(
                                 // sequence-extension/compare on the ACK path and
                                 // lets a later OOO arrival recover an already
                                 // ACK-inferred capture gap immediately.
-                                let ack_outcome = state.half_mut(dir.opposite()).acknowledge(ack, packet.ts_ns, tcp_gap_timeout_ns);
+                                let ack_outcome = state.half_mut(dir.opposite()).acknowledge(
+                                    ack,
+                                    packet.ts_ns,
+                                    tcp_gap_timeout_ns,
+                                );
                                 emitted_content |= emit_tcp_outcome(
                                     state,
                                     ack_outcome,
@@ -416,13 +526,7 @@ fn shard_loop(
                                     metrics.tcp_out_of_order.fetch_add(1, Ordering::Relaxed);
                                 }
                                 emitted_content |= emit_tcp_outcome(
-                                    state,
-                                    outcome,
-                                    dir,
-                                    &key_copy,
-                                    flow_id,
-                                    &output,
-                                    &metrics,
+                                    state, outcome, dir, &key_copy, flow_id, &output, &metrics,
                                     shard_id,
                                 );
                             }
@@ -451,7 +555,9 @@ fn shard_loop(
 
                 if emitted_content {
                     let now = Instant::now();
-                    if !state.visible || now.duration_since(state.last_snapshot) >= cfg.live_flow_update_interval {
+                    if !state.visible
+                        || now.duration_since(state.last_snapshot) >= cfg.live_flow_update_interval
+                    {
                         state.visible = true;
                         state.last_snapshot = now;
                         if output.send(FlowOutput::Snapshot(state.summary())).is_err() {
@@ -485,10 +591,19 @@ fn shard_loop(
                     if packet.key.protocol == TransportProtocol::Tcp {
                         tombstones.insert(key.clone(), Instant::now());
                     }
-                    close_flow(&mut flows, &key, &output, &metrics, shard_id);
+                    close_flow(
+                        &mut flows,
+                        &key,
+                        &output,
+                        &metrics,
+                        shard_id,
+                        &mut source_counts,
+                    );
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                metrics.touch_progress();
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
@@ -512,7 +627,14 @@ fn shard_loop(
             let flow_id = flow.id;
             if next_deadline <= now {
                 debug!(shard_id, flow_id = %flow_id, "flow idle timeout");
-                close_flow(&mut flows, &item.key, &output, &metrics, shard_id);
+                close_flow(
+                    &mut flows,
+                    &item.key,
+                    &output,
+                    &metrics,
+                    shard_id,
+                    &mut source_counts,
+                );
             } else {
                 serial = serial.wrapping_add(1);
                 timers.push(TimerItem {
@@ -528,7 +650,8 @@ fn shard_loop(
         // deadline. Compact occasionally so a connection storm cannot grow the
         // heap toward `flow_rate * timeout`; the steady-state bound stays close
         // to the number of active flows.
-        if timers.len() > 4096 && timers.len() > flows.len().saturating_mul(2).saturating_add(1024) {
+        if timers.len() > 4096 && timers.len() > flows.len().saturating_mul(2).saturating_add(1024)
+        {
             let mut rebuilt = BinaryHeap::with_capacity(flows.len());
             for (key, flow) in &flows {
                 serial = serial.wrapping_add(1);
@@ -554,7 +677,25 @@ fn shard_loop(
             metrics.flows_completed.fetch_add(1, Ordering::Relaxed);
         }
         metrics.active_flows.fetch_sub(1, Ordering::Relaxed);
+        if let Some(count) = source_counts.get_mut(&flow.source_prefix) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                source_counts.remove(&flow.source_prefix);
+            }
+        }
     }
+}
+
+/// Atomically reserve one slot in the global flow-state budget. Existing flows
+/// never execute this CAS loop; the steady-state packet path remains unchanged.
+fn try_admit_flow(metrics: &Metrics, max_active_flows: usize) -> bool {
+    let max_active_flows = max_active_flows as u64;
+    metrics
+        .active_flows
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < max_active_flows).then_some(current + 1)
+        })
+        .is_ok()
 }
 
 fn emit_tcp_outcome(
@@ -568,9 +709,13 @@ fn emit_tcp_outcome(
     shard_id: usize,
 ) -> bool {
     if !outcome.gaps.is_empty() {
-        metrics.tcp_gap_events.fetch_add(outcome.gaps.len() as u64, Ordering::Relaxed);
+        metrics
+            .tcp_gap_events
+            .fetch_add(outcome.gaps.len() as u64, Ordering::Relaxed);
         let gap_bytes = outcome.gaps.iter().map(|g| g.len).sum::<u64>();
-        metrics.tcp_gap_bytes.fetch_add(gap_bytes, Ordering::Relaxed);
+        metrics
+            .tcp_gap_bytes
+            .fetch_add(gap_bytes, Ordering::Relaxed);
     }
 
     let mut emitted = false;
@@ -608,8 +753,26 @@ fn finalize_tcp_halves(
     let ts_ns = flow.last_seen_ns;
     let a = flow.a_to_b.finalize(ts_ns);
     let b = flow.b_to_a.finalize(ts_ns);
-    let emitted_a = emit_tcp_outcome(flow, a, Direction::AToB, key, flow_id, output, metrics, shard_id);
-    let emitted_b = emit_tcp_outcome(flow, b, Direction::BToA, key, flow_id, output, metrics, shard_id);
+    let emitted_a = emit_tcp_outcome(
+        flow,
+        a,
+        Direction::AToB,
+        key,
+        flow_id,
+        output,
+        metrics,
+        shard_id,
+    );
+    let emitted_b = emit_tcp_outcome(
+        flow,
+        b,
+        Direction::BToA,
+        key,
+        flow_id,
+        output,
+        metrics,
+        shard_id,
+    );
     if emitted_a || emitted_b {
         flow.visible = true;
     }
@@ -621,6 +784,7 @@ fn close_flow(
     output: &L7Ingress,
     metrics: &Metrics,
     shard_id: usize,
+    source_counts: &mut AHashMap<SourcePrefix, usize>,
 ) {
     if let Some(mut flow) = flows.remove(key) {
         finalize_tcp_halves(&mut flow, key, output, metrics, shard_id);
@@ -629,6 +793,12 @@ fn close_flow(
             metrics.flows_completed.fetch_add(1, Ordering::Relaxed);
         }
         metrics.active_flows.fetch_sub(1, Ordering::Relaxed);
+        if let Some(count) = source_counts.get_mut(&flow.source_prefix) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                source_counts.remove(&flow.source_prefix);
+            }
+        }
     }
 }
 
@@ -637,11 +807,19 @@ fn ns_to_datetime(ns: u64) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn active_flow_admission_is_globally_bounded() {
+        let metrics = Metrics::default();
+        assert!(try_admit_flow(&metrics, 2));
+        assert!(try_admit_flow(&metrics, 2));
+        assert!(!try_admit_flow(&metrics, 2));
+        assert_eq!(metrics.active_flows.load(Ordering::Relaxed), 2);
+    }
 
     fn tcp_packet(seq: u32, syn: bool) -> ParsedPacket {
         let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -653,7 +831,10 @@ mod tests {
             direction,
             seq: Some(seq),
             ack: Some(0),
-            flags: crate::model::TcpFlags { syn, ..Default::default() },
+            flags: crate::model::TcpFlags {
+                syn,
+                ..Default::default()
+            },
             payload: bytes::Bytes::new(),
             wire_len: 60,
         }
@@ -663,7 +844,16 @@ mod tests {
     fn retransmitted_syn_with_same_isn_keeps_generation() {
         let first = tcp_packet(1000, true);
         let mut state = FlowState::new(&first);
-        let _ = state.half_mut(first.direction).accept(1000, true, false, 1, bytes::Bytes::new(), 1024, 128, 1_000_000_000);
+        let _ = state.half_mut(first.direction).accept(
+            1000,
+            true,
+            false,
+            1,
+            bytes::Bytes::new(),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let retry = tcp_packet(1000, true);
         let new_isn = tcp_packet(2000, true);
         assert!(state.is_syn_retransmit(&retry));
@@ -686,7 +876,8 @@ mod tests {
     fn query_summary_preserves_observed_initiator_not_canonical_order() {
         let client = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200));
         let server = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let (key, direction) = FlowKey::canonical(client, 50000, server, 80, TransportProtocol::Tcp);
+        let (key, direction) =
+            FlowKey::canonical(client, 50000, server, 80, TransportProtocol::Tcp);
         assert_eq!(direction, Direction::BToA);
         let packet = ParsedPacket {
             ts_ns: 1_700_000_000_000_000_000,
@@ -694,7 +885,10 @@ mod tests {
             direction,
             seq: Some(10),
             ack: Some(0),
-            flags: crate::model::TcpFlags { syn: true, ..Default::default() },
+            flags: crate::model::TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
             payload: bytes::Bytes::new(),
             wire_len: 60,
         };

@@ -1,6 +1,6 @@
 [package]
 name = "bazalt"
-version = "0.4.1"
+version = "0.4.1+hotfix.2"
 edition = "2021"
 rust-version = "1.85"
 description = "High-throughput A/D CTF traffic capture and retrospective analysis platform"

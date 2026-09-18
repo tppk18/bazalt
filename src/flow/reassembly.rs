@@ -205,7 +205,11 @@ impl TcpHalf {
                     }
                 }
                 if start < data.len() {
-                    let tail = if start == 0 { data } else { data.slice(start..) };
+                    let tail = if start == 0 {
+                        data
+                    } else {
+                        data.slice(start..)
+                    };
                     let tail_abs = start_abs.saturating_add(start as u64);
                     if self.out_of_order.is_empty() {
                         // Dominant fast path: in-order traffic stays zero-copy and
@@ -239,10 +243,15 @@ impl TcpHalf {
     /// its cumulative ACK. Timeout/pressure recovery remains independent of ACKs.
     pub fn acknowledge(&mut self, ack: u32, ts_ns: u64, gap_timeout_ns: u64) -> ReassemblyOutcome {
         let mut out = ReassemblyOutcome::default();
-        let Some(expected) = self.next_abs else { return out; };
+        let Some(expected) = self.next_abs else {
+            return out;
+        };
         let ack_abs = extend_seq(ack, expected);
         if ack_abs > expected
-            && self.peer_ack_abs.map(|current| ack_abs > current).unwrap_or(true)
+            && self
+                .peer_ack_abs
+                .map(|current| ack_abs > current)
+                .unwrap_or(true)
         {
             self.peer_ack_abs = Some(ack_abs);
         }
@@ -256,9 +265,13 @@ impl TcpHalf {
     }
 
     fn recover_known_ack(&mut self, ts_ns: u64, out: &mut ReassemblyOutcome) {
-        let Some(ack_abs) = self.peer_ack_abs else { return; };
+        let Some(ack_abs) = self.peer_ack_abs else {
+            return;
+        };
         loop {
-            let Some(expected) = self.next_abs else { return; };
+            let Some(expected) = self.next_abs else {
+                return;
+            };
             if expected >= ack_abs {
                 return;
             }
@@ -351,16 +364,24 @@ impl TcpHalf {
     pub fn finalize(&mut self, ts_ns: u64) -> ReassemblyOutcome {
         let mut out = ReassemblyOutcome::default();
         loop {
-            let Some(expected) = self.next_abs else { break; };
-            let Some((&first, _)) = self.out_of_order.first_key_value() else { break; };
+            let Some(expected) = self.next_abs else {
+                break;
+            };
+            let Some((&first, _)) = self.out_of_order.first_key_value() else {
+                break;
+            };
             if first > expected {
                 self.emit_gap_to(first, ts_ns, &mut out);
             }
             let before_seq = self.next_abs;
             let before_bytes = self.out_of_order_bytes;
             self.flush_ooo(&mut out);
-            if self.fin_consumed { break; }
-            if self.next_abs == before_seq && self.out_of_order_bytes == before_bytes { break; }
+            if self.fin_consumed {
+                break;
+            }
+            if self.next_abs == before_seq && self.out_of_order_bytes == before_bytes {
+                break;
+            }
         }
         // If only a future FIN remains with no captured bytes after the hole,
         // there is nothing useful to salvage at close. Do not invent a giant
@@ -388,7 +409,9 @@ impl TcpHalf {
 
         while cursor < end {
             // If an existing first-seen interval covers cursor, skip its bytes.
-            if let Some((&existing_start, existing)) = self.out_of_order.range(..=cursor).next_back() {
+            if let Some((&existing_start, existing)) =
+                self.out_of_order.range(..=cursor).next_back()
+            {
                 let existing_end = existing.end(existing_start);
                 if existing_end > cursor {
                     out.retransmit = true;
@@ -398,7 +421,10 @@ impl TcpHalf {
             }
 
             // Insert only the uncovered prefix before the next existing range.
-            let next = self.out_of_order.range(cursor..end).next()
+            let next = self
+                .out_of_order
+                .range(cursor..end)
+                .next()
                 .map(|(&s, seg)| (s, seg.end(s)));
             let piece_end = next.map(|(s, _)| s).unwrap_or(end).min(end);
             if piece_end > cursor {
@@ -408,7 +434,13 @@ impl TcpHalf {
                 // batch. In-order traffic remains zero-copy.
                 let compact = Bytes::copy_from_slice(&data[from..to]);
                 self.out_of_order_bytes = self.out_of_order_bytes.saturating_add(compact.len());
-                self.out_of_order.insert(cursor, BufferedSegment { data: compact, ts_ns });
+                self.out_of_order.insert(
+                    cursor,
+                    BufferedSegment {
+                        data: compact,
+                        ts_ns,
+                    },
+                );
                 cursor = piece_end;
             }
 
@@ -421,9 +453,17 @@ impl TcpHalf {
         }
     }
 
-    fn recover_ooo_pressure(&mut self, max_ooo: usize, max_segments: usize, ts_ns: u64, out: &mut ReassemblyOutcome) {
+    fn recover_ooo_pressure(
+        &mut self,
+        max_ooo: usize,
+        max_segments: usize,
+        ts_ns: u64,
+        out: &mut ReassemblyOutcome,
+    ) {
         while self.out_of_order_bytes > max_ooo || self.out_of_order.len() > max_segments {
-            let Some((&first, _)) = self.out_of_order.first_key_value() else { break; };
+            let Some((&first, _)) = self.out_of_order.first_key_value() else {
+                break;
+            };
             let expected = self.next_abs.expect("initialized");
             if first > expected {
                 self.emit_gap_to(first, ts_ns, out);
@@ -437,11 +477,21 @@ impl TcpHalf {
     }
 
     fn emit(&mut self, data: Bytes, ts_ns: u64, out: &mut ReassemblyOutcome) {
-        if data.is_empty() { return; }
+        if data.is_empty() {
+            return;
+        }
         let offset = self.stream_offset;
         self.stream_offset = self.stream_offset.saturating_add(data.len() as u64);
-        self.next_abs = Some(self.next_abs.expect("initialized").saturating_add(data.len() as u64));
-        out.emitted.push(ReassembledChunk { offset, ts_ns, data });
+        self.next_abs = Some(
+            self.next_abs
+                .expect("initialized")
+                .saturating_add(data.len() as u64),
+        );
+        out.emitted.push(ReassembledChunk {
+            offset,
+            ts_ns,
+            data,
+        });
         self.consume_fin_if_ready(out);
     }
 
@@ -451,7 +501,9 @@ impl TcpHalf {
             // Never synthesize sequence bytes across a FIN marker.
             target = target.min(fin);
         }
-        if target <= expected { return; }
+        if target <= expected {
+            return;
+        }
         let len = target - expected;
         let offset = self.stream_offset;
         self.stream_offset = self.stream_offset.saturating_add(len);
@@ -462,8 +514,13 @@ impl TcpHalf {
 
     fn flush_ooo(&mut self, out: &mut ReassemblyOutcome) {
         loop {
-            if self.fin_consumed { return; }
-            let expected = match self.next_abs { Some(v) => v, None => return };
+            if self.fin_consumed {
+                return;
+            }
+            let expected = match self.next_abs {
+                Some(v) => v,
+                None => return,
+            };
             let first_key = match self.out_of_order.first_key_value().map(|(&k, _)| k) {
                 Some(v) => v,
                 None => return,
@@ -475,7 +532,9 @@ impl TcpHalf {
             self.out_of_order_bytes = self.out_of_order_bytes.saturating_sub(segment.data.len());
             if first_key < expected {
                 let overlap = expected.saturating_sub(first_key) as usize;
-                if overlap >= segment.data.len() { continue; }
+                if overlap >= segment.data.len() {
+                    continue;
+                }
                 self.emit(segment.data.slice(overlap..), segment.ts_ns, out);
             } else {
                 self.emit(segment.data, segment.ts_ns, out);
@@ -484,12 +543,15 @@ impl TcpHalf {
     }
 
     fn consume_fin_if_ready(&mut self, out: &mut ReassemblyOutcome) {
-        if self.fin_consumed { return; }
-        let (Some(fin), Some(next)) = (self.pending_fin, self.next_abs) else { return; };
+        if self.fin_consumed {
+            return;
+        }
+        let (Some(fin), Some(next)) = (self.pending_fin, self.next_abs) else {
+            return;
+        };
         if fin <= next {
             if fin == next {
-                if self.pending_fin_requires_ack
-                    && !self.peer_ack_abs.is_some_and(|ack| ack > fin)
+                if self.pending_fin_requires_ack && !self.peer_ack_abs.is_some_and(|ack| ack > fin)
                 {
                     return;
                 }
@@ -523,11 +585,38 @@ mod tests {
     #[test]
     fn reassembles_out_of_order_and_preserves_timestamp() {
         let mut h = TcpHalf::default();
-        let a = h.accept(100, false, false, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        let a = h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(a.emitted[0].data.as_ref(), b"abcd");
-        let b = h.accept(108, false, false, 2, Bytes::from_static(b"ijkl"), 1024, 128, 1_000_000_000);
+        let b = h.accept(
+            108,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"ijkl"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(b.emitted.is_empty());
-        let c = h.accept(104, false, false, 3, Bytes::from_static(b"efgh"), 1024, 128, 1_000_000_000);
+        let c = h.accept(
+            104,
+            false,
+            false,
+            3,
+            Bytes::from_static(b"efgh"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(c.emitted.len(), 2);
         assert_eq!(c.emitted[0].data.as_ref(), b"efgh");
         assert_eq!(c.emitted[0].ts_ns, 3);
@@ -538,8 +627,26 @@ mod tests {
     #[test]
     fn suppresses_retransmit_and_keeps_new_tail() {
         let mut h = TcpHalf::default();
-        h.accept(10, false, false, 1, Bytes::from_static(b"abcdef"), 1024, 128, 1_000_000_000);
-        let r = h.accept(12, false, false, 2, Bytes::from_static(b"cdefGH"), 1024, 128, 1_000_000_000);
+        h.accept(
+            10,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcdef"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let r = h.accept(
+            12,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"cdefGH"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(r.retransmit);
         assert_eq!(r.emitted[0].data.as_ref(), b"GH");
         assert_eq!(r.emitted[0].offset, 6);
@@ -549,10 +656,28 @@ mod tests {
     fn syn_observation_prevents_first_ooo_payload_from_becoming_stream_start() {
         let mut h = TcpHalf::default();
         h.observe(100, true);
-        let late = h.accept(105, false, false, 2, Bytes::from_static(b"efgh"), 1024, 128, 1_000_000_000);
+        let late = h.accept(
+            105,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"efgh"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(late.out_of_order);
         assert!(late.emitted.is_empty());
-        let early = h.accept(101, false, false, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        let early = h.accept(
+            101,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(early.emitted.len(), 2);
         assert_eq!(early.emitted[0].data.as_ref(), b"abcd");
         assert_eq!(early.emitted[1].data.as_ref(), b"efgh");
@@ -562,10 +687,41 @@ mod tests {
     fn conflicting_ooo_overlap_is_first_seen_wins() {
         let mut h = TcpHalf::default();
         h.observe(100, false);
-        h.accept(110, false, false, 1, Bytes::from_static(b"BBBB"), 1024, 128, 1_000_000_000);
-        h.accept(108, false, false, 2, Bytes::from_static(b"AAXXXX"), 1024, 128, 1_000_000_000);
-        let gap = h.accept(100, false, false, 3, Bytes::from_static(b"abcdefgh"), 1024, 128, 1_000_000_000);
-        let joined = gap.emitted.iter().flat_map(|c| c.data.iter().copied()).collect::<Vec<_>>();
+        h.accept(
+            110,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"BBBB"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        h.accept(
+            108,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"AAXXXX"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let gap = h.accept(
+            100,
+            false,
+            false,
+            3,
+            Bytes::from_static(b"abcdefgh"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let joined = gap
+            .emitted
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(&joined, b"abcdefghAABBBB");
     }
 
@@ -573,9 +729,31 @@ mod tests {
     fn bridging_in_order_segment_cannot_overwrite_first_seen_ooo_bytes() {
         let mut h = TcpHalf::default();
         h.observe(100, false);
-        h.accept(110, false, false, 1, Bytes::from_static(b"BBBB"), 1024, 128, 1_000_000_000);
-        let r = h.accept(100, false, false, 2, Bytes::from_static(b"abcdefghijXXXXtail"), 1024, 128, 1_000_000_000);
-        let joined = r.emitted.iter().flat_map(|c| c.data.iter().copied()).collect::<Vec<_>>();
+        h.accept(
+            110,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"BBBB"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let r = h.accept(
+            100,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"abcdefghijXXXXtail"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let joined = r
+            .emitted
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(&joined, b"abcdefghijBBBBtail");
         assert!(r.retransmit);
     }
@@ -584,18 +762,67 @@ mod tests {
     fn wraparound_ooo_uses_extended_sequence_order() {
         let mut h = TcpHalf::default();
         h.observe(0xffff_fff0, false);
-        h.accept(0x0000_0000, false, false, 2, Bytes::from_static(b"BBBB"), 1024, 128, 1_000_000_000);
-        h.accept(0xffff_fff8, false, false, 1, Bytes::from_static(b"AAAAAAAA"), 1024, 128, 1_000_000_000);
-        let first = h.accept(0xffff_fff0, false, false, 0, Bytes::from_static(b"12345678"), 1024, 128, 1_000_000_000);
-        let joined = first.emitted.iter().flat_map(|c| c.data.iter().copied()).collect::<Vec<_>>();
+        h.accept(
+            0x0000_0000,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"BBBB"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        h.accept(
+            0xffff_fff8,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"AAAAAAAA"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let first = h.accept(
+            0xffff_fff0,
+            false,
+            false,
+            0,
+            Bytes::from_static(b"12345678"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let joined = first
+            .emitted
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(&joined, b"12345678AAAAAAAABBBB");
     }
 
     #[test]
     fn opposite_ack_recovers_confirmed_capture_gap() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"aaaa"), 1024, 128, 1_000_000_000);
-        h.accept(108, false, false, 2, Bytes::from_static(b"cccc"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        h.accept(
+            108,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"cccc"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let r = h.acknowledge(112, 3, 1_000_000_000);
         assert_eq!(r.gaps, vec![StreamGap { offset: 4, len: 4 }]);
         assert_eq!(r.emitted.len(), 1);
@@ -606,10 +833,28 @@ mod tests {
     #[test]
     fn ack_arriving_before_ooo_is_remembered_for_later_gap_recovery() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"aaaa"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let ack = h.acknowledge(108, 2, 1_000_000_000);
         assert!(ack.gaps.is_empty());
-        let later = h.accept(108, false, false, 3, Bytes::from_static(b"cccc"), 1024, 128, 1_000_000_000);
+        let later = h.accept(
+            108,
+            false,
+            false,
+            3,
+            Bytes::from_static(b"cccc"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(later.gaps, vec![StreamGap { offset: 4, len: 4 }]);
         assert_eq!(later.emitted.len(), 1);
         assert_eq!(later.emitted[0].data.as_ref(), b"cccc");
@@ -618,8 +863,26 @@ mod tests {
     #[test]
     fn ack_before_first_ooo_still_advances_inferred_gap_prefix() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"aaaa"), 1024, 128, 1_000_000_000);
-        h.accept(120, false, false, 2, Bytes::from_static(b"zzzz"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        h.accept(
+            120,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"zzzz"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let r = h.acknowledge(112, 3, 1_000_000_000);
         assert_eq!(r.gaps, vec![StreamGap { offset: 4, len: 8 }]);
         assert!(r.emitted.is_empty());
@@ -633,8 +896,26 @@ mod tests {
     fn ooo_interval_count_limit_bounds_tiny_segment_metadata() {
         let mut h = TcpHalf::default();
         h.observe(100, false);
-        let _ = h.accept(200, false, false, 1, Bytes::from_static(b"a"), 1024, 1, 1_000_000_000);
-        let r = h.accept(202, false, false, 2, Bytes::from_static(b"b"), 1024, 1, 1_000_000_000);
+        let _ = h.accept(
+            200,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"a"),
+            1024,
+            1,
+            1_000_000_000,
+        );
+        let r = h.accept(
+            202,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"b"),
+            1024,
+            1,
+            1_000_000_000,
+        );
         assert!(!r.gaps.is_empty());
         assert!(!r.emitted.is_empty());
     }
@@ -643,17 +924,44 @@ mod tests {
     fn ooo_limit_resyncs_instead_of_killing_stream() {
         let mut h = TcpHalf::default();
         h.observe(100, false);
-        let r = h.accept(200, false, false, 1, Bytes::from_static(b"payload"), 1, 128, 1_000_000_000);
+        let r = h.accept(
+            200,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"payload"),
+            1,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(r.gaps.len(), 1);
         assert_eq!(r.emitted[0].data.as_ref(), b"payload");
-        let n = h.accept(207, false, false, 2, Bytes::from_static(b"next"), 1, 128, 1_000_000_000);
+        let n = h.accept(
+            207,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"next"),
+            1,
+            128,
+            1_000_000_000,
+        );
         assert_eq!(n.emitted[0].data.as_ref(), b"next");
     }
 
     #[test]
     fn acknowledged_out_of_order_fin_recovers_missing_tail_without_fake_fin_byte() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"aaaa"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let ack = h.acknowledge(109, 2, 1_000_000_000);
         assert!(ack.gaps.is_empty());
         let fin = h.accept(108, false, true, 3, Bytes::new(), 1024, 128, 1_000_000_000);
@@ -665,7 +973,16 @@ mod tests {
     #[test]
     fn off_sequence_rst_does_not_match_receive_next() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(h.rst_matches_next(104));
         assert!(!h.rst_matches_next(4000));
     }
@@ -673,20 +990,69 @@ mod tests {
     #[test]
     fn small_gap_recovers_after_timeout_without_ack_or_pressure() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1_000, Bytes::from_static(b"aaaa"), 1024, 128, 100);
-        let first_ooo = h.accept(108, false, false, 1_010, Bytes::from_static(b"cccc"), 1024, 128, 100);
+        h.accept(
+            100,
+            false,
+            false,
+            1_000,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            100,
+        );
+        let first_ooo = h.accept(
+            108,
+            false,
+            false,
+            1_010,
+            Bytes::from_static(b"cccc"),
+            1024,
+            128,
+            100,
+        );
         assert!(first_ooo.gaps.is_empty());
-        let timed = h.accept(112, false, false, 1_200, Bytes::from_static(b"dddd"), 1024, 128, 100);
+        let timed = h.accept(
+            112,
+            false,
+            false,
+            1_200,
+            Bytes::from_static(b"dddd"),
+            1024,
+            128,
+            100,
+        );
         assert_eq!(timed.gaps, vec![StreamGap { offset: 4, len: 4 }]);
-        let joined = timed.emitted.iter().flat_map(|c| c.data.iter().copied()).collect::<Vec<_>>();
+        let joined = timed
+            .emitted
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(&joined, b"ccccdddd");
     }
 
     #[test]
     fn finalize_drains_buffered_bytes_with_explicit_gap() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"aaaa"), 1024, 128, 1_000_000_000);
-        h.accept(108, false, false, 2, Bytes::from_static(b"cccc"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"aaaa"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        h.accept(
+            108,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"cccc"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let final_out = h.finalize(3);
         assert_eq!(final_out.gaps, vec![StreamGap { offset: 4, len: 4 }]);
         assert_eq!(final_out.emitted[0].data.as_ref(), b"cccc");
@@ -695,7 +1061,16 @@ mod tests {
     #[test]
     fn stale_fin_behind_rcv_next_does_not_close_half() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"abcdefgh"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcdefgh"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let stale = h.accept(99, false, true, 2, Bytes::new(), 1024, 128, 1_000_000_000);
         assert!(!stale.fin_consumed);
         assert!(!h.fin_consumed());
@@ -704,11 +1079,33 @@ mod tests {
     #[test]
     fn payload_beyond_unacked_ooo_fin_invalidates_tentative_fin() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         let fin = h.accept(108, false, true, 2, Bytes::new(), 1024, 128, 1_000_000_000);
         assert!(!fin.fin_consumed);
-        let bridge = h.accept(104, false, false, 3, Bytes::from_static(b"efghXXXX"), 1024, 128, 1_000_000_000);
-        let emitted = bridge.emitted.iter().flat_map(|c| c.data.iter().copied()).collect::<Vec<_>>();
+        let bridge = h.accept(
+            104,
+            false,
+            false,
+            3,
+            Bytes::from_static(b"efghXXXX"),
+            1024,
+            128,
+            1_000_000_000,
+        );
+        let emitted = bridge
+            .emitted
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(&emitted, b"efghXXXX");
         assert!(!bridge.fin_consumed);
         assert!(!h.fin_consumed());
@@ -717,20 +1114,56 @@ mod tests {
     #[test]
     fn acked_ooo_fin_is_a_hard_payload_boundary() {
         let mut h = TcpHalf::default();
-        h.accept(100, false, false, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        h.accept(
+            100,
+            false,
+            false,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         h.accept(108, false, true, 2, Bytes::new(), 1024, 128, 1_000_000_000);
         let _ = h.acknowledge(109, 3, 1_000_000_000);
         assert!(h.fin_consumed());
-        let late = h.accept(104, false, false, 4, Bytes::from_static(b"efghXXXX"), 1024, 128, 1_000_000_000);
+        let late = h.accept(
+            104,
+            false,
+            false,
+            4,
+            Bytes::from_static(b"efghXXXX"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(late.emitted.is_empty());
     }
 
     #[test]
     fn payload_after_consumed_fin_is_ignored() {
         let mut h = TcpHalf::default();
-        let first = h.accept(100, false, true, 1, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        let first = h.accept(
+            100,
+            false,
+            true,
+            1,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(first.fin_consumed);
-        let late = h.accept(105, false, false, 2, Bytes::from_static(b"late"), 1024, 128, 1_000_000_000);
+        let late = h.accept(
+            105,
+            false,
+            false,
+            2,
+            Bytes::from_static(b"late"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(late.emitted.is_empty());
         assert!(late.retransmit);
     }
@@ -741,7 +1174,16 @@ mod tests {
         h.observe(100, false);
         let fin = h.accept(104, false, true, 2, Bytes::new(), 1024, 128, 1_000_000_000);
         assert!(!fin.fin_consumed);
-        let data = h.accept(100, false, false, 3, Bytes::from_static(b"abcd"), 1024, 128, 1_000_000_000);
+        let data = h.accept(
+            100,
+            false,
+            false,
+            3,
+            Bytes::from_static(b"abcd"),
+            1024,
+            128,
+            1_000_000_000,
+        );
         assert!(!data.fin_consumed);
         assert!(!h.fin_consumed());
         let ack = h.acknowledge(105, 4, 1_000_000_000);

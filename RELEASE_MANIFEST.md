@@ -1,6 +1,57 @@
-# BAZALT 0.4.1 — traffic-fidelity release
+# BAZALT 0.4.1.2 — second stabilization tranche
 
-## 0.4.1 build hygiene
+This hotfix implements a coherent second half-step of the pre-feature P0/P1 work while deliberately leaving the ordering/disk-retention redesign for the next tranche. Cargo reports `0.4.1+hotfix.2`; the external/API release label comes from `VERSION` and is `0.4.1.2`.
+
+## Fixed in 0.4.1.2
+
+- Restored the lost new-flow discriminator in `flow/mod.rs` using the behavior confirmed by the older 0.4.1 source, while preserving the newer bounded admission path.
+- ClickHouse is no longer a synchronous metadata acceptance dependency. Metadata batches are fsync'd to a bounded local spool and projected asynchronously with an explicit HTTP timeout; replay checkpoints wait for local durability rather than ClickHouse availability.
+- Clean shutdown also waits only for local spool durability, so a ClickHouse outage cannot hang SIGTERM. Retention still uses the stronger projected barrier before destructive deletion.
+- Critical capture/raw, flow, L7, matcher, segment, metadata-spool and metadata-projector workers are supervised. Unexpected exit marks health false, triggers ordered shutdown and returns a non-zero process result.
+- Added a cheap protected `/api/health` endpoint and made the Docker HEALTHCHECK auth-aware. `/api/status` still exposes richer status but is no longer used as the container liveness probe.
+- PostgreSQL/ClickHouse compose credentials no longer ship as known production passwords; ClickHouse now uses a dedicated authenticated user. The smoke harness supplies isolated test-only credentials.
+- Invalid boolean environment values now fail startup instead of silently falling back to defaults.
+- HTTP gzip/deflate decoding now has both a reduced absolute output cap (16 MiB default) and a configurable expansion-ratio cap (`BAZALT_HTTP_MAX_DECODE_RATIO`, default 32). This bounds the previous 128 MiB decoded allocation; full streaming/off-thread decoding remains deferred.
+- Startup reconciles the newest recovered segment into the durable metadata spool, closing the segment-bytes/content-index crash window for the active crash tail.
+- Metadata spool occupancy/capacity are exported as Prometheus gauges and participate in live-pressure throttling, so historical replay yields before consuming the entire outage buffer.
+- Source verification no longer silently skips Rust checks when `cargo` is missing; missing Rust tooling is a hard verification failure.
+
+## Intentionally still open after 0.4.1.2
+
+- Exact live/replay/deferred activation watermark (`ingest_seq` / `activation_seq`).
+- A true durable deferred live-matcher queue. Live matching remains blocking after storage acceptance rather than silently dropping matches when saturated.
+- Full streaming/off-thread HTTP decompression. The current change bounds amplification but decoding still executes in the L7 worker.
+- Global normalized-segment/raw-PCAP disk quota and automatic pressure retention policy.
+- Two-tier embryonic/established flow admission for tuple-flood resistance.
+- Wall-clock TCP gap timers, DLT validation, BPF update failure policy, pattern soft-delete and the remaining P1/P2 items.
+- `Cargo.lock` / `--locked` reproducible dependency resolution.
+
+---
+
+# BAZALT 0.4.1.1 — traffic-fidelity release
+
+## 0.4.1.1 P0 stabilization tranche
+
+This patch intentionally fixes the first, relatively independent half of the v0.4.1 P0 backlog without restructuring the capture/L7 pipeline. The external release label is `0.4.1.1`; because Cargo requires three-component SemVer, `Cargo.toml` uses `0.4.1+hotfix.1` while the API reports the release label from `VERSION`.
+
+- PostgreSQL is bound to `127.0.0.1:65001`; ClickHouse HTTP is bound to `127.0.0.1:65002`; the unused native ClickHouse port is no longer published.
+- Historical replay checkpoints are commit points: each segment waits for matcher workers, the hit collector, and `MetadataSink::barrier()` before `segments_done` advances.
+- Match timestamps inherit `ContentRecord.ts_ns`, keeping replayed matches aligned with traffic time and retention semantics.
+- Immutable segment scans are strict. CRC/encoding/interior-truncation errors propagate to replay/retention instead of being interpreted as EOF. Startup may truncate only a physically incomplete tail of the newest segment; a complete record with a bad CRC remains a hard error.
+- Segment record length is checked against `BAZALT_SEGMENT_MAX_RECORD_BYTES` before payload allocation, and the writer enforces the same bound.
+- Active flow state has a global `BAZALT_MAX_ACTIVE_FLOWS` admission limit. The global atomic CAS is executed only for a new tuple, leaving existing-flow packet processing unchanged.
+- Match amplification is bounded by `BAZALT_MATCH_MAX_HITS_PER_PATTERN` and `BAZALT_MATCH_MAX_HITS_PER_RECORD`; the total budget counts candidate occurrences so suppressed repetitive matches cannot force unbounded enumeration.
+
+New observability counters:
+
+- `bazalt_flow_state_rejections_total`;
+- `bazalt_matcher_match_limit_events_total`.
+
+### Deliberately deferred to the second P0 tranche
+
+The following known issues are not represented as fixed in 0.4.1.1: matcher backpressure isolation/storage-first fanout, bounded streaming HTTP decompression, critical-worker supervision, an exact live/replay activation watermark, and a global normalized-segment disk budget. They require coordinated pipeline changes and are intentionally separated from this low-risk tranche.
+
+## 0.4.1.1 build hygiene
 
 - fixes the stale `MetadataSink` unit-test call site from 0.4.0-r1;
 - removes the two rustc warnings in `capture/parser.rs`;

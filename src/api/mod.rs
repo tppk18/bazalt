@@ -1,8 +1,18 @@
-use std::{collections::{HashMap, HashSet}, net::SocketAddr, sync::Arc};
 use parking_lot::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{
+        ws::{Message, WebSocket},
+        ConnectInfo, Path, Query, Request, State, WebSocketUpgrade,
+    },
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -23,7 +33,9 @@ use crate::{
     metrics::Metrics,
     model::{LiveEvent, NewPattern, PatternRevision, ServiceConfig, TrafficFilter},
     replay::ReplayHandle,
-    storage::{clickhouse::ClickHouseStore, postgres::PostgresStore, segment::SegmentStore, MetadataSink},
+    storage::{
+        clickhouse::ClickHouseStore, postgres::PostgresStore, segment::SegmentStore, MetadataSink,
+    },
 };
 
 #[derive(Clone)]
@@ -40,6 +52,7 @@ pub struct ApiState {
     pub services: Arc<ServiceRegistry>,
     pub live_events: broadcast::Sender<LiveEvent>,
     pub missing_segments_warned: Arc<Mutex<HashSet<String>>>,
+    pub healthy: Arc<AtomicBool>,
 }
 
 pub async fn serve(
@@ -49,6 +62,7 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/api/status", get(status))
+        .route("/api/health", get(health))
         .route("/api/resources", get(resource_status))
         .route("/metrics", get(prometheus_metrics))
         .route("/api/flows", get(flows))
@@ -57,12 +71,18 @@ pub async fn serve(
         .route("/api/flows/{id}/favorite", post(set_favorite))
         .route("/api/content/{id}", get(content))
         .route("/api/patterns", get(list_patterns).post(create_pattern))
-        .route("/api/patterns/{id}", put(update_pattern).delete(delete_pattern))
+        .route(
+            "/api/patterns/{id}",
+            put(update_pattern).delete(delete_pattern),
+        )
         .route("/api/patterns/{id}/enabled", patch(set_pattern_enabled))
         .route("/api/patterns/{id}/lookback", post(lookback_pattern))
         .route("/api/replay/jobs", get(replay_jobs))
         .route("/api/services", get(list_services).post(create_service))
-        .route("/api/services/{port}", put(update_service).delete(delete_service))
+        .route(
+            "/api/services/{port}",
+            put(update_service).delete(delete_service),
+        )
         .route("/api/management/storage", get(management_storage))
         .route("/api/management/cleanup", post(management_cleanup))
         .route("/api/live", get(live_ws))
@@ -79,22 +99,31 @@ pub async fn serve(
         .merge(protected)
         .fallback_service(ServeDir::new("frontend").append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn_with_state(state.clone(), access_control))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            access_control,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP/UI server listening");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move {
-            if *shutdown.borrow() { return; }
-            while shutdown.changed().await.is_ok() {
-                if *shutdown.borrow() { break; }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        if *shutdown.borrow() {
+            return;
+        }
+        while shutdown.changed().await.is_ok() {
+            if *shutdown.borrow() {
+                break;
             }
-        })
-        .await?;
+        }
+    })
+    .await?;
     Ok(())
 }
-
 
 #[derive(Deserialize)]
 struct LoginRequest {
@@ -109,7 +138,9 @@ async fn login(
 ) -> Response {
     match s.auth.login(peer.ip(), &req.username, &req.password) {
         Ok(token) => {
-            let mut response = Json(serde_json::json!({"ok": true, "auth_enabled": s.auth.enabled()})).into_response();
+            let mut response =
+                Json(serde_json::json!({"ok": true, "auth_enabled": s.auth.enabled()}))
+                    .into_response();
             if s.auth.enabled() {
                 if let Ok(value) = HeaderValue::from_str(&s.auth.set_cookie_header(&token)) {
                     response.headers_mut().insert(header::SET_COOKIE, value);
@@ -120,11 +151,13 @@ async fn login(
         Err(LoginError::Forbidden) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "invalid credentials"})),
-        ).into_response(),
+        )
+            .into_response(),
         Err(LoginError::RateLimited) => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "too many failed login attempts; retry later"})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -139,14 +172,16 @@ async fn logout(State(s): State<ApiState>, request: Request) -> Response {
 
 async fn access_control(State(s): State<ApiState>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    let protected = path == "/metrics" || path == "/auth/logout" || path == "/api" || path.starts_with("/api/");
+    let protected =
+        path == "/metrics" || path == "/auth/logout" || path == "/api" || path.starts_with("/api/");
     if !protected || s.auth.is_authorized(request.headers()) {
         return next.run(request).await;
     }
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({"error": "forbidden"})),
-    ).into_response()
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -157,12 +192,15 @@ struct CleanupRequest {
 
 async fn management_storage(State(s): State<ApiState>) -> ApiResult<Json<serde_json::Value>> {
     let segments = s.segments.clone();
-    let segment_stats = tokio::task::spawn_blocking(move || segments.disk_stats()).await.map_err(anyhow::Error::from)??;
+    let segment_stats = tokio::task::spawn_blocking(move || segments.disk_stats())
+        .await
+        .map_err(anyhow::Error::from)??;
     let (clickhouse, postgres_bytes) = tokio::try_join!(
         s.clickhouse.storage_stats(),
         s.postgres.database_size_bytes(),
     )?;
-    let total = clickhouse.total_bytes_on_disk
+    let total = clickhouse
+        .total_bytes_on_disk
         .saturating_add(postgres_bytes)
         .saturating_add(segment_stats.bytes);
     Ok(Json(serde_json::json!({
@@ -179,35 +217,47 @@ async fn management_cleanup(
     Json(req): Json<CleanupRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if req.confirm != "DELETE" {
-        return Err(ApiError::bad_request("explicit cleanup confirmation DELETE is required"));
+        return Err(ApiError::bad_request(
+            "explicit cleanup confirmation DELETE is required",
+        ));
     }
     if req.older_than_seconds == 0 {
-        return Err(ApiError::bad_request("older_than_seconds must be greater than zero"));
+        return Err(ApiError::bad_request(
+            "older_than_seconds must be greater than zero",
+        ));
     }
     let seconds = i64::try_from(req.older_than_seconds)
         .map_err(|_| ApiError::bad_request("retention duration is too large"))?;
     let cutoff = chrono::Utc::now()
         .checked_sub_signed(chrono::Duration::seconds(seconds))
         .ok_or_else(|| ApiError::bad_request("retention cutoff is outside supported range"))?;
-    let cutoff_ns = cutoff.timestamp_nanos_opt()
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
         .filter(|v| *v >= 0)
-        .ok_or_else(|| ApiError::bad_request("retention cutoff predates UNIX epoch"))? as u64;
+        .ok_or_else(|| ApiError::bad_request("retention cutoff predates UNIX epoch"))?
+        as u64;
 
     // Exclude historical replay for the whole seal/mutation/delete sequence.
     let _maintenance_guard = s.maintenance.write().await;
 
     let segments = s.segments.clone();
-    let candidates = tokio::task::spawn_blocking(move || segments.retention_candidates(cutoff_ns)).await.map_err(anyhow::Error::from)??;
+    let candidates = tokio::task::spawn_blocking(move || segments.retention_candidates(cutoff_ns))
+        .await
+        .map_err(anyhow::Error::from)??;
 
     // The segment seal publishes ContentIndex events. Wait until all metadata
     // ordered before this point is in ClickHouse before issuing mutations.
     let metadata = s.metadata.clone();
-    tokio::task::spawn_blocking(move || metadata.barrier()).await.map_err(anyhow::Error::from)??;
+    tokio::task::spawn_blocking(move || metadata.barrier())
+        .await
+        .map_err(anyhow::Error::from)??;
 
     let mutation = s.clickhouse.delete_before(cutoff).await?;
     let segments = s.segments.clone();
     let delete_paths = candidates.clone();
-    let deleted = tokio::task::spawn_blocking(move || segments.delete_segments(&delete_paths)).await.map_err(anyhow::Error::from)??;
+    let deleted = tokio::task::spawn_blocking(move || segments.delete_segments(&delete_paths))
+        .await
+        .map_err(anyhow::Error::from)??;
 
     tracing::warn!(
         cutoff=%mutation.cutoff,
@@ -227,23 +277,46 @@ async fn management_cleanup(
 }
 
 async fn api_not_found() -> Response {
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "not found"})),
+    )
+        .into_response()
 }
 
 async fn prometheus_metrics(State(s): State<ApiState>) -> Response {
-    ([
-        (header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
-    ], s.metrics.prometheus()).into_response()
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        s.metrics.prometheus(),
+    )
+        .into_response()
+}
+
+async fn health(State(s): State<ApiState>) -> Response {
+    let ok = s.healthy.load(Ordering::Acquire);
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(serde_json::json!({"ok": ok}))).into_response()
 }
 
 async fn status(State(s): State<ApiState>) -> ApiResult<Json<serde_json::Value>> {
-    let service_spm = s.clickhouse.query_service_spm().await.unwrap_or_else(|error| {
-        tracing::debug!(%error, "cannot query per-service SPM");
-        HashMap::new()
-    });
+    let service_spm = s
+        .clickhouse
+        .query_service_spm()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "cannot query per-service SPM");
+            HashMap::new()
+        });
     Ok(Json(serde_json::json!({
-        "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
+        "ok": s.healthy.load(Ordering::Acquire),
+        "version": env!("BAZALT_RELEASE_VERSION"),
         "metrics": s.metrics.snapshot(),
         "live_pressure_pct": s.metrics.live_pressure_pct(),
         "services": s.services.list(),
@@ -259,34 +332,66 @@ async fn resource_status(State(s): State<ApiState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn flows(State(s): State<ApiState>, Query(filter): Query<TrafficFilter>) -> ApiResult<Json<serde_json::Value>> {
-    let favorites = s.postgres.list_favorites().await?.into_iter().collect::<HashSet<_>>();
+async fn flows(
+    State(s): State<ApiState>,
+    Query(filter): Query<TrafficFilter>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let favorites = s
+        .postgres
+        .list_favorites()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let active_ignores = s.patterns.active_ignore_revisions();
-    let rows = s.clickhouse.query_flows(&filter, &favorites, &active_ignores).await?;
+    let rows = s
+        .clickhouse
+        .query_flows(&filter, &favorites, &active_ignores)
+        .await?;
     let ids = rows.iter().map(|row| row.flow_id).collect::<Vec<_>>();
-    let pattern_ids = s.clickhouse.query_pattern_ids_for_flows(&ids).await.unwrap_or_else(|error| {
-        tracing::warn!(%error, "cannot enrich flow list with pattern ids");
-        HashMap::new()
-    });
-    let user_agents = s.clickhouse.query_user_agents_for_flows(&ids).await.unwrap_or_else(|error| {
-        tracing::warn!(%error, "cannot enrich flow list with user agents");
-        HashMap::new()
-    });
+    let pattern_ids = s
+        .clickhouse
+        .query_pattern_ids_for_flows(&ids)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot enrich flow list with pattern ids");
+            HashMap::new()
+        });
+    let user_agents = s
+        .clickhouse
+        .query_user_agents_for_flows(&ids)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot enrich flow list with user agents");
+            HashMap::new()
+        });
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let flow_id = row.flow_id;
         let mut value = serde_json::to_value(row).map_err(anyhow::Error::from)?;
         if let Some(object) = value.as_object_mut() {
-            object.insert("favorite".into(), serde_json::json!(favorites.contains(&flow_id)));
-            object.insert("user_agent".into(), serde_json::json!(user_agents.get(&flow_id)));
-            object.insert("pattern_ids".into(), serde_json::json!(pattern_ids.get(&flow_id).cloned().unwrap_or_default()));
+            object.insert(
+                "favorite".into(),
+                serde_json::json!(favorites.contains(&flow_id)),
+            );
+            object.insert(
+                "user_agent".into(),
+                serde_json::json!(user_agents.get(&flow_id)),
+            );
+            object.insert(
+                "pattern_ids".into(),
+                serde_json::json!(pattern_ids.get(&flow_id).cloned().unwrap_or_default()),
+            );
         }
         items.push(value);
     }
-    Ok(Json(serde_json::json!({"items":items,"limit":filter.limit.unwrap_or(100),"offset":filter.offset.unwrap_or(0)})))
+    Ok(Json(
+        serde_json::json!({"items":items,"limit":filter.limit.unwrap_or(100),"offset":filter.offset.unwrap_or(0)}),
+    ))
 }
 
-fn suppress_redundant_tcp_raw(records: Vec<crate::model::ContentRecord>) -> Vec<crate::model::ContentRecord> {
+fn suppress_redundant_tcp_raw(
+    records: Vec<crate::model::ContentRecord>,
+) -> Vec<crate::model::ContentRecord> {
     use crate::model::{ContentView, Direction};
 
     // HTTP semantic records describe the same reassembled TCP byte range as
@@ -304,10 +409,12 @@ fn suppress_redundant_tcp_raw(records: Vec<crate::model::ContentRecord>) -> Vec<
                 | ContentView::HttpResponseBody
         );
         if semantic && !record.data.is_empty() {
-            coverage
-                .entry(record.direction)
-                .or_default()
-                .push((record.stream_offset, record.stream_offset.saturating_add(record.data.len() as u64)));
+            coverage.entry(record.direction).or_default().push((
+                record.stream_offset,
+                record
+                    .stream_offset
+                    .saturating_add(record.data.len() as u64),
+            ));
         }
     }
 
@@ -336,7 +443,11 @@ fn suppress_redundant_tcp_raw(records: Vec<crate::model::ContentRecord>) -> Vec<
             let end = start.saturating_add(record.data.len() as u64);
             !coverage
                 .get(&record.direction)
-                .map(|ranges| ranges.iter().any(|(covered_start, covered_end)| *covered_start <= start && *covered_end >= end))
+                .map(|ranges| {
+                    ranges.iter().any(|(covered_start, covered_end)| {
+                        *covered_start <= start && *covered_end >= end
+                    })
+                })
                 .unwrap_or(false)
         })
         .collect()
@@ -357,8 +468,14 @@ fn project_matches_to_visible_content(
     visible_records: &[crate::model::ContentRecord],
     matches: Vec<crate::model::MatchRecord>,
 ) -> HashMap<Uuid, Vec<crate::model::MatchRecord>> {
-    let visible_ids = visible_records.iter().map(|record| record.id).collect::<HashSet<_>>();
-    let by_id = all_records.iter().map(|record| (record.id, record)).collect::<HashMap<_, _>>();
+    let visible_ids = visible_records
+        .iter()
+        .map(|record| record.id)
+        .collect::<HashSet<_>>();
+    let by_id = all_records
+        .iter()
+        .map(|record| (record.id, record))
+        .collect::<HashMap<_, _>>();
     let mut out = HashMap::<Uuid, Vec<crate::model::MatchRecord>>::new();
 
     for hit in matches {
@@ -367,8 +484,12 @@ fn project_matches_to_visible_content(
             continue;
         }
 
-        let Some(source) = by_id.get(&hit.content_id).copied() else { continue; };
-        if source.view != crate::model::ContentView::TcpRaw { continue; }
+        let Some(source) = by_id.get(&hit.content_id).copied() else {
+            continue;
+        };
+        if source.view != crate::model::ContentView::TcpRaw {
+            continue;
+        }
 
         // ANYWHERE patterns intentionally scan the canonical reassembled TCP
         // stream once. When that raw record is hidden because HTTP has an
@@ -376,9 +497,10 @@ fn project_matches_to_visible_content(
         // HTTP record instead of rescanning duplicate bytes in the matcher.
         // This preserves highlighting while keeping matcher CPU linear in the
         // canonical byte stream.
-        for target in visible_records.iter().filter(|record| {
-            record.direction == source.direction && is_http_wire_view(record.view)
-        }) {
+        for target in visible_records
+            .iter()
+            .filter(|record| record.direction == source.direction && is_http_wire_view(record.view))
+        {
             let target_start = target.stream_offset;
             let target_end = target_start.saturating_add(target.data.len() as u64);
             if hit.offset_start >= target_end || hit.offset_end <= target_start {
@@ -404,12 +526,23 @@ fn project_matches_to_visible_content(
     out
 }
 
-async fn flow_content(State(s):State<ApiState>,Path(id):Path<Uuid>)->ApiResult<Json<serde_json::Value>>{
-    let flow = s.clickhouse.query_flow(id).await?.ok_or_else(|| ApiError::not_found("flow not found"))?;
+async fn flow_content(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let flow = s
+        .clickhouse
+        .query_flow(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("flow not found"))?;
     let (_, request_direction) = crate::model::FlowKey::canonical(
-        flow.src_ip.parse::<std::net::IpAddr>().map_err(anyhow::Error::from)?,
+        flow.src_ip
+            .parse::<std::net::IpAddr>()
+            .map_err(anyhow::Error::from)?,
         flow.src_port,
-        flow.dst_ip.parse::<std::net::IpAddr>().map_err(anyhow::Error::from)?,
+        flow.dst_ip
+            .parse::<std::net::IpAddr>()
+            .map_err(anyhow::Error::from)?,
         flow.dst_port,
         flow.protocol,
     );
@@ -453,7 +586,8 @@ async fn flow_content(State(s):State<ApiState>,Path(id):Path<Uuid>)->ApiResult<J
         Ok(ordered.into_iter().flatten().collect())
     }).await.map_err(|e| anyhow::anyhow!(e))??;
     let records = suppress_redundant_tcp_raw(all_records.clone());
-    let mut matches_by_content = project_matches_to_visible_content(&all_records, &records, matches);
+    let mut matches_by_content =
+        project_matches_to_visible_content(&all_records, &records, matches);
     let items=records.into_iter().map(|r| {
         let request = match r.view {
             crate::model::ContentView::HttpRequestHeaders | crate::model::ContentView::HttpRequestBody | crate::model::ContentView::HttpRequestDecodedBody => true,
@@ -475,28 +609,58 @@ async fn flow_content(State(s):State<ApiState>,Path(id):Path<Uuid>)->ApiResult<J
     Ok(Json(serde_json::json!({"items":items})))
 }
 
-async fn flow_detail(State(s): State<ApiState>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
-    let flow = s.clickhouse.query_flow(id).await?.ok_or_else(|| ApiError::not_found("flow not found"))?;
+async fn flow_detail(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let flow = s
+        .clickhouse
+        .query_flow(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("flow not found"))?;
     let http = s.clickhouse.query_http_for_flow(id).await?;
     let matches = s.clickhouse.query_matches_for_flow(id).await?;
     let favorite = s.postgres.list_favorites().await?.contains(&id);
-    Ok(Json(serde_json::json!({"flow":flow,"http":http,"matches":matches,"favorite":favorite})))
+    Ok(Json(
+        serde_json::json!({"flow":flow,"http":http,"matches":matches,"favorite":favorite}),
+    ))
 }
 
 #[derive(Deserialize)]
-struct FavoriteRequest { favorite: bool }
-async fn set_favorite(State(s):State<ApiState>,Path(id):Path<Uuid>,Json(req):Json<FavoriteRequest>)->ApiResult<Json<serde_json::Value>>{
-    s.postgres.set_favorite(id,req.favorite).await?;
-    Ok(Json(serde_json::json!({"flow_id":id,"favorite":req.favorite})))
+struct FavoriteRequest {
+    favorite: bool,
+}
+async fn set_favorite(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<FavoriteRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    s.postgres.set_favorite(id, req.favorite).await?;
+    Ok(Json(
+        serde_json::json!({"flow_id":id,"favorite":req.favorite}),
+    ))
 }
 
 #[derive(Deserialize)]
-struct ContentQuery { format: Option<String> }
-async fn content(State(s):State<ApiState>,Path(id):Path<Uuid>,Query(q):Query<ContentQuery>)->ApiResult<Response>{
-    let idx=s.clickhouse.query_content_index(id).await?.ok_or_else(||ApiError::not_found("content not found"))?;
-    let store=s.segments.clone();
-    let record=tokio::task::spawn_blocking(move || store.read_at(std::path::Path::new(&idx.segment_path),idx.segment_offset))
-        .await.map_err(|e| anyhow::anyhow!(e))??;
+struct ContentQuery {
+    format: Option<String>,
+}
+async fn content(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ContentQuery>,
+) -> ApiResult<Response> {
+    let idx = s
+        .clickhouse
+        .query_content_index(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("content not found"))?;
+    let store = s.segments.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        store.read_at(std::path::Path::new(&idx.segment_path), idx.segment_offset)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!(e))??;
     match q.format.as_deref() {
         Some("raw") => Ok(([(header::CONTENT_TYPE,"application/octet-stream")],record.data.to_vec()).into_response()),
         Some("hex") => Ok(Json(serde_json::json!({"id":id,"view":record.view,"data":hex::encode(&record.data)})).into_response()),
@@ -505,11 +669,16 @@ async fn content(State(s):State<ApiState>,Path(id):Path<Uuid>,Query(q):Query<Con
     }
 }
 
-async fn list_patterns(State(s):State<ApiState>)->ApiResult<Json<Vec<PatternRevision>>>{Ok(Json(s.patterns.list().await?))}
-async fn create_pattern(State(s):State<ApiState>,Json(req):Json<NewPattern>)->ApiResult<(StatusCode,Json<PatternRevision>)>{
-    let p=s.patterns.create(req).await?;
+async fn list_patterns(State(s): State<ApiState>) -> ApiResult<Json<Vec<PatternRevision>>> {
+    Ok(Json(s.patterns.list().await?))
+}
+async fn create_pattern(
+    State(s): State<ApiState>,
+    Json(req): Json<NewPattern>,
+) -> ApiResult<(StatusCode, Json<PatternRevision>)> {
+    let p = s.patterns.create(req).await?;
     s.replay.enqueue(p.clone()).await?;
-    Ok((StatusCode::CREATED,Json(p)))
+    Ok((StatusCode::CREATED, Json(p)))
 }
 
 #[derive(Deserialize)]
@@ -526,34 +695,80 @@ struct UpdatePatternRequest {
     view: Option<crate::model::ContentView>,
     enabled: Option<bool>,
 }
-fn default_pattern_color_api() -> String { "#FF7474".to_owned() }
-async fn update_pattern(State(s):State<ApiState>,Path(id):Path<Uuid>,Json(req):Json<UpdatePatternRequest>)->ApiResult<Json<PatternRevision>>{
-    let enabled=req.enabled.unwrap_or(true);
-    let p=s.patterns.update(id,NewPattern{name:req.name,expression:req.expression,kind:req.kind,action:req.action,color:req.color,direction_type:req.direction_type,service:req.service,view:req.view},enabled).await?;
-    if enabled { s.replay.enqueue(p.clone()).await?; }
+fn default_pattern_color_api() -> String {
+    "#FF7474".to_owned()
+}
+async fn update_pattern(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdatePatternRequest>,
+) -> ApiResult<Json<PatternRevision>> {
+    let enabled = req.enabled.unwrap_or(true);
+    let p = s
+        .patterns
+        .update(
+            id,
+            NewPattern {
+                name: req.name,
+                expression: req.expression,
+                kind: req.kind,
+                action: req.action,
+                color: req.color,
+                direction_type: req.direction_type,
+                service: req.service,
+                view: req.view,
+            },
+            enabled,
+        )
+        .await?;
+    if enabled {
+        s.replay.enqueue(p.clone()).await?;
+    }
     Ok(Json(p))
 }
-#[derive(Deserialize)] struct EnabledRequest{enabled:bool}
-async fn set_pattern_enabled(State(s):State<ApiState>,Path(id):Path<Uuid>,Json(req):Json<EnabledRequest>)->ApiResult<Json<PatternRevision>>{
-    let p=s.patterns.set_enabled(id,req.enabled).await?;
-    if req.enabled { s.replay.enqueue(p.clone()).await?; }
+#[derive(Deserialize)]
+struct EnabledRequest {
+    enabled: bool,
+}
+async fn set_pattern_enabled(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<EnabledRequest>,
+) -> ApiResult<Json<PatternRevision>> {
+    let p = s.patterns.set_enabled(id, req.enabled).await?;
+    if req.enabled {
+        s.replay.enqueue(p.clone()).await?;
+    }
     Ok(Json(p))
 }
 
-async fn delete_pattern(State(s):State<ApiState>,Path(id):Path<Uuid>)->ApiResult<StatusCode>{
+async fn delete_pattern(State(s): State<ApiState>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     if !s.patterns.delete(id).await? {
         return Err(ApiError::not_found("pattern not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn lookback_pattern(State(s):State<ApiState>,Path(id):Path<Uuid>)->ApiResult<(StatusCode,Json<serde_json::Value>)>{
-    let p=s.patterns.postgres().latest_pattern(id).await?.ok_or_else(||ApiError::not_found("pattern not found"))?;
+async fn lookback_pattern(
+    State(s): State<ApiState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let p = s
+        .patterns
+        .postgres()
+        .latest_pattern(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("pattern not found"))?;
     s.replay.enqueue(p.clone()).await?;
-    Ok((StatusCode::ACCEPTED,Json(serde_json::json!({"pattern_id":id,"revision":p.revision,"queued":true}))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"pattern_id":id,"revision":p.revision,"queued":true})),
+    ))
 }
 
-async fn replay_jobs(State(s):State<ApiState>)->ApiResult<Json<serde_json::Value>>{Ok(Json(serde_json::json!({"items":s.replay.jobs().await?})))}
+async fn replay_jobs(State(s): State<ApiState>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({"items":s.replay.jobs().await?})))
+}
 
 async fn list_services(State(s): State<ApiState>) -> Json<Vec<ServiceConfig>> {
     Json(s.services.list())
@@ -579,18 +794,24 @@ struct CreateServiceRequest {
     service: ServiceRequest,
 }
 
-fn default_service_http() -> bool { true }
+fn default_service_http() -> bool {
+    true
+}
 
 fn validate_service(port: u16, req: &ServiceRequest) -> ApiResult<()> {
     if port == 0 {
-        return Err(ApiError::bad_request("service port must be between 1 and 65535"));
+        return Err(ApiError::bad_request(
+            "service port must be between 1 and 65535",
+        ));
     }
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request("service name is empty"));
     }
     if name.len() > 128 {
-        return Err(ApiError::bad_request("service name is longer than 128 characters"));
+        return Err(ApiError::bad_request(
+            "service name is longer than 128 characters",
+        ));
     }
     Ok(())
 }
@@ -612,7 +833,9 @@ async fn create_service(
 ) -> ApiResult<(StatusCode, Json<ServiceConfig>)> {
     validate_service(req.port, &req.service)?;
     if s.services.by_port(req.port).is_some() {
-        return Err(ApiError::conflict("a service with this port already exists"));
+        return Err(ApiError::conflict(
+            "a service with this port already exists",
+        ));
     }
     let service = service_from_request(req.port, req.service);
     let saved = s.postgres.upsert_service(&service).await?;
@@ -634,10 +857,7 @@ async fn update_service(
     Ok(Json(saved))
 }
 
-async fn delete_service(
-    State(s): State<ApiState>,
-    Path(port): Path<u16>,
-) -> ApiResult<StatusCode> {
+async fn delete_service(State(s): State<ApiState>, Path(port): Path<u16>) -> ApiResult<StatusCode> {
     if !s.postgres.delete_service(port).await? {
         return Err(ApiError::not_found("service not found"));
     }
@@ -646,10 +866,12 @@ async fn delete_service(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn live_ws(ws:WebSocketUpgrade,State(s):State<ApiState>)->Response{ws.on_upgrade(move |socket|live_socket(socket,s.live_events.subscribe()))}
-async fn live_socket(mut socket:WebSocket,mut rx:broadcast::Receiver<LiveEvent>){
-    loop{
-        tokio::select!{
+async fn live_ws(ws: WebSocketUpgrade, State(s): State<ApiState>) -> Response {
+    ws.on_upgrade(move |socket| live_socket(socket, s.live_events.subscribe()))
+}
+async fn live_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<LiveEvent>) {
+    loop {
+        tokio::select! {
             evt=rx.recv()=>match evt{Ok(evt)=>{if let Ok(text)=serde_json::to_string(&evt){if socket.send(Message::Text(text.into())).await.is_err(){break;}}},Err(broadcast::error::RecvError::Lagged(_))=>continue,Err(_)=>break},
             msg=socket.next()=>match msg{Some(Ok(Message::Close(_)))|None=>break,Some(Err(_))=>break,_=>{}}
         }
@@ -663,7 +885,12 @@ mod content_dedup_tests {
     use bytes::Bytes;
     use uuid::Uuid;
 
-    fn record(view: ContentView, direction: Direction, offset: u64, data: &'static [u8]) -> ContentRecord {
+    fn record(
+        view: ContentView,
+        direction: Direction,
+        offset: u64,
+        data: &'static [u8],
+    ) -> ContentRecord {
         ContentRecord {
             id: Uuid::new_v4(),
             flow_id: Uuid::nil(),
@@ -706,9 +933,19 @@ mod content_dedup_tests {
     #[test]
     fn hides_split_raw_chunks_covered_by_one_http_record() {
         let records = vec![
-            record(ContentView::TcpRaw, Direction::AToB, 0, b"GET / HTTP/1.1\r\n"),
+            record(
+                ContentView::TcpRaw,
+                Direction::AToB,
+                0,
+                b"GET / HTTP/1.1\r\n",
+            ),
             record(ContentView::TcpRaw, Direction::AToB, 16, b"Host: x\r\n\r\n"),
-            record(ContentView::HttpRequestHeaders, Direction::AToB, 0, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+            record(
+                ContentView::HttpRequestHeaders,
+                Direction::AToB,
+                0,
+                b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            ),
         ];
         let out = suppress_redundant_tcp_raw(records);
         assert_eq!(out.len(), 1);
@@ -718,8 +955,18 @@ mod content_dedup_tests {
     #[test]
     fn keeps_uncovered_raw_fallback() {
         let records = vec![
-            record(ContentView::HttpResponseHeaders, Direction::BToA, 0, b"HTTP/1.1 200 OK\r\n\r\n"),
-            record(ContentView::TcpRaw, Direction::BToA, 19, b"4\r\ntest\r\n0\r\n\r\n"),
+            record(
+                ContentView::HttpResponseHeaders,
+                Direction::BToA,
+                0,
+                b"HTTP/1.1 200 OK\r\n\r\n",
+            ),
+            record(
+                ContentView::TcpRaw,
+                Direction::BToA,
+                19,
+                b"4\r\ntest\r\n0\r\n\r\n",
+            ),
         ];
         let out = suppress_redundant_tcp_raw(records);
         assert_eq!(out.len(), 2);
@@ -730,7 +977,12 @@ mod content_dedup_tests {
     fn never_treats_decoded_body_as_raw_coverage() {
         let records = vec![
             record(ContentView::TcpRaw, Direction::BToA, 100, b"compressed"),
-            record(ContentView::HttpResponseDecodedBody, Direction::BToA, 100, b"decoded"),
+            record(
+                ContentView::HttpResponseDecodedBody,
+                Direction::BToA,
+                100,
+                b"decoded",
+            ),
         ];
         let out = suppress_redundant_tcp_raw(records);
         assert_eq!(out.len(), 2);
@@ -747,7 +999,9 @@ mod content_dedup_tests {
         let visible = suppress_redundant_tcp_raw(all.clone());
         let projected = project_matches_to_visible_content(&all, &visible, vec![match_record]);
         assert!(!projected.contains_key(&raw.id));
-        let hits = projected.get(&http.id).expect("match should move to visible HTTP record");
+        let hits = projected
+            .get(&http.id)
+            .expect("match should move to visible HTTP record");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].content_id, http.id);
         assert_eq!(hits[0].view, ContentView::HttpRequestHeaders);
@@ -765,12 +1019,42 @@ mod content_dedup_tests {
     }
 }
 
-pub type ApiResult<T>=Result<T,ApiError>;
-#[derive(Debug)] pub struct ApiError{status:StatusCode,message:String}
-impl ApiError{
-    fn not_found(m:&str)->Self{Self{status:StatusCode::NOT_FOUND,message:m.into()}}
-    fn bad_request(m:&str)->Self{Self{status:StatusCode::BAD_REQUEST,message:m.into()}}
-    fn conflict(m:&str)->Self{Self{status:StatusCode::CONFLICT,message:m.into()}}
+pub type ApiResult<T> = Result<T, ApiError>;
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
 }
-impl From<anyhow::Error> for ApiError{fn from(e:anyhow::Error)->Self{Self{status:StatusCode::INTERNAL_SERVER_ERROR,message:e.to_string()}}}
-impl IntoResponse for ApiError{fn into_response(self)->Response{(self.status,Json(serde_json::json!({"error":self.message}))).into_response()}}
+impl ApiError {
+    fn not_found(m: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: m.into(),
+        }
+    }
+    fn bad_request(m: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: m.into(),
+        }
+    }
+    fn conflict(m: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: m.into(),
+        }
+    }
+}
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }
+    }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(serde_json::json!({"error":self.message}))).into_response()
+    }
+}

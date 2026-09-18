@@ -1,23 +1,29 @@
 use std::{
     collections::VecDeque,
     io::Read,
-    sync::{atomic::{AtomicU64, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use ahash::AHashMap;
 use anyhow::{bail, Result};
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender};
 use flate2::read::{GzDecoder, ZlibDecoder};
-use arc_swap::ArcSwap;
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     matching::MatcherIngress,
     metrics::Metrics,
-    model::{ContentRecord, ContentView, Direction, FlowId, FlowKey, FlowOutput, HttpRecord, MatchInput, MetadataEvent, ServiceConfig, StreamChunk},
+    model::{
+        ContentRecord, ContentView, Direction, FlowId, FlowKey, FlowOutput, HttpRecord, MatchInput,
+        MetadataEvent, ServiceConfig, StreamChunk,
+    },
     storage::segment::SegmentStore,
 };
 
@@ -35,7 +41,10 @@ impl ServiceRegistry {
         for service in initial {
             map.insert(service.port, service);
         }
-        Arc::new(Self { by_port: ArcSwap::from_pointee(map), generation: AtomicU64::new(1) })
+        Arc::new(Self {
+            by_port: ArcSwap::from_pointee(map),
+            generation: AtomicU64::new(1),
+        })
     }
 
     pub fn upsert(&self, service: ServiceConfig) {
@@ -98,19 +107,24 @@ impl ServiceRegistry {
             Direction::BToA => key.a.port,
         };
         let current = self.by_port.load();
-        current.get(&port).map(|service| service.name.clone()).unwrap_or_else(|| format!("http:{port}"))
+        current
+            .get(&port)
+            .map(|service| service.name.clone())
+            .unwrap_or_else(|| format!("http:{port}"))
     }
 
     pub fn service_for_flow(&self, key: &FlowKey) -> Option<String> {
         let current = self.by_port.load();
-        current.get(&key.a.port)
+        current
+            .get(&key.a.port)
             .or_else(|| current.get(&key.b.port))
             .map(|service| service.name.clone())
     }
 
     pub fn should_parse_http(&self, key: &FlowKey) -> bool {
         let current = self.by_port.load();
-        current.get(&key.a.port)
+        current
+            .get(&key.a.port)
             .or_else(|| current.get(&key.b.port))
             .map(|service| service.http)
             .unwrap_or(false)
@@ -124,7 +138,10 @@ pub struct L7Ingress {
 }
 
 impl L7Ingress {
-    pub fn send(&self, event: FlowOutput) -> std::result::Result<usize, crossbeam_channel::SendError<FlowOutput>> {
+    pub fn send(
+        &self,
+        event: FlowOutput,
+    ) -> std::result::Result<usize, crossbeam_channel::SendError<FlowOutput>> {
         let flow_id = match &event {
             FlowOutput::Chunk(chunk) => chunk.flow_id,
             FlowOutput::Snapshot(summary) | FlowOutput::Closed(summary) => summary.flow_id,
@@ -132,7 +149,10 @@ impl L7Ingress {
         let idx = (flow_id.as_u128() as usize) % self.shard_txs.len();
         let tx = &self.shard_txs[idx];
         tx.send(event)?;
-        Ok(Metrics::queue_enqueued(&self.metrics.l7_queue_depth, &self.metrics.l7_queue_high_watermark) as usize)
+        Ok(Metrics::queue_enqueued(
+            &self.metrics.l7_queue_depth,
+            &self.metrics.l7_queue_high_watermark,
+        ) as usize)
     }
 }
 
@@ -142,13 +162,23 @@ pub struct L7Runtime {
 }
 
 impl L7Runtime {
-    pub fn worker_count(&self) -> usize { self.handles.len() }
+    pub fn worker_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn critical_worker_finished(&self) -> bool {
+        self.handles
+            .iter()
+            .any(std::thread::JoinHandle::is_finished)
+    }
 
     pub fn join(self) -> anyhow::Result<()> {
         let L7Runtime { input, handles } = self;
         drop(input);
         for handle in handles {
-            handle.join().map_err(|_| anyhow::anyhow!("L7 worker panicked"))?;
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("L7 worker panicked"))?;
         }
         Ok(())
     }
@@ -164,7 +194,10 @@ pub fn spawn_l7(
 ) -> anyhow::Result<L7Runtime> {
     let worker_count = cfg.l7_workers.max(1);
     let per_worker_capacity = (cfg.flow_to_l7_capacity / worker_count).max(1);
-    metrics.l7_queue_capacity.store((per_worker_capacity * worker_count) as u64, Ordering::Relaxed);
+    metrics.l7_queue_capacity.store(
+        (per_worker_capacity * worker_count) as u64,
+        Ordering::Relaxed,
+    );
     let mut worker_txs = Vec::with_capacity(worker_count);
     let mut handles = Vec::with_capacity(worker_count);
 
@@ -177,23 +210,41 @@ pub fn spawn_l7(
         let metadata2 = metadata_tx.clone();
         let services2 = services.clone();
         let metrics2 = metrics.clone();
-        let l7_cpu = if cfg.l7_cpus.is_empty() { None } else { Some(cfg.l7_cpus[worker_id % cfg.l7_cpus.len()]) };
-        handles.push(std::thread::Builder::new()
-            .name(format!("l7-http-{worker_id}"))
-            .spawn(move || {
-                if let Some(cpu) = l7_cpu {
-                    match crate::affinity::pin_current(cpu) {
-                        Ok(actual) if actual != cpu => tracing::info!(worker_id, requested_cpu=cpu, actual_cpu=actual, "L7 worker CPU remapped to container cpuset"),
-                        Ok(_) => {},
-                        Err(e) => tracing::warn!(worker_id, cpu, error=%e, "cannot pin L7 worker"),
+        let l7_cpu = if cfg.l7_cpus.is_empty() {
+            None
+        } else {
+            Some(cfg.l7_cpus[worker_id % cfg.l7_cpus.len()])
+        };
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("l7-http-{worker_id}"))
+                .spawn(move || {
+                    if let Some(cpu) = l7_cpu {
+                        match crate::affinity::pin_current(cpu) {
+                            Ok(actual) if actual != cpu => tracing::info!(
+                                worker_id,
+                                requested_cpu = cpu,
+                                actual_cpu = actual,
+                                "L7 worker CPU remapped to container cpuset"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(worker_id, cpu, error=%e, "cannot pin L7 worker")
+                            }
+                        }
                     }
-                }
-                l7_worker_loop(cfg2, rx, matcher2, segments2, metadata2, services2, metrics2)
-            })?);
+                    l7_worker_loop(
+                        cfg2, rx, matcher2, segments2, metadata2, services2, metrics2,
+                    )
+                })?,
+        );
     }
 
     Ok(L7Runtime {
-        input: L7Ingress { shard_txs: Arc::new(worker_txs), metrics },
+        input: L7Ingress {
+            shard_txs: Arc::new(worker_txs),
+            metrics,
+        },
         handles,
     })
 }
@@ -210,6 +261,7 @@ fn l7_worker_loop(
     let mut parsers: AHashMap<FlowId, HttpConnection> = AHashMap::new();
     let mut detected_services: AHashMap<FlowId, String> = AHashMap::new();
     while let Ok(event) = flow_rx.recv() {
+        metrics.touch_progress();
         Metrics::queue_dequeued(&metrics.l7_queue_depth);
         match event {
             FlowOutput::Chunk(chunk) => {
@@ -219,10 +271,14 @@ fn l7_worker_loop(
                 let parsed_events = if chunk.key.protocol == crate::model::TransportProtocol::Tcp
                     && services.should_parse_http(&chunk.key)
                 {
-                    let parser = parsers.entry(chunk.flow_id).or_insert_with(|| HttpConnection::new(cfg.clone()));
+                    let parser = parsers
+                        .entry(chunk.flow_id)
+                        .or_insert_with(|| HttpConnection::new(cfg.clone()));
                     let report = parser.feed(&chunk);
                     if report.parse_errors != 0 {
-                        metrics.http_parse_errors.fetch_add(report.parse_errors, Ordering::Relaxed);
+                        metrics
+                            .http_parse_errors
+                            .fetch_add(report.parse_errors, Ordering::Relaxed);
                     }
                     Some(report.events)
                 } else {
@@ -246,9 +302,23 @@ fn l7_worker_loop(
                         if let Some(req_dir) = evt.request_direction {
                             let service = services.service_for_http(&chunk.key, req_dir);
                             detected_services.insert(chunk.flow_id, service.clone());
-                            emit_http_event(evt, Some(service), &matcher_tx, &segments, &metadata_tx, &metrics);
+                            emit_http_event(
+                                evt,
+                                Some(service),
+                                &matcher_tx,
+                                &segments,
+                                &metadata_tx,
+                                &metrics,
+                            );
                         } else {
-                            emit_http_event(evt, detected_services.get(&chunk.flow_id).cloned(), &matcher_tx, &segments, &metadata_tx, &metrics);
+                            emit_http_event(
+                                evt,
+                                detected_services.get(&chunk.flow_id).cloned(),
+                                &matcher_tx,
+                                &segments,
+                                &metadata_tx,
+                                &metrics,
+                            );
                         }
                     }
                 }
@@ -257,44 +327,69 @@ fn l7_worker_loop(
                 summary.service = summary.service.or_else(|| {
                     let a = summary.src_port;
                     let b = summary.dst_port;
-                    services.by_port(a).or_else(|| services.by_port(b)).map(|service| service.name)
+                    services
+                        .by_port(a)
+                        .or_else(|| services.by_port(b))
+                        .map(|service| service.name)
                 });
-                if metadata_tx.send(MetadataEvent::Flow(summary)).is_err() { break; }
+                if metadata_tx.send(MetadataEvent::Flow(summary)).is_err() {
+                    break;
+                }
             }
             FlowOutput::Closed(mut summary) => {
                 if let Some(mut parser) = parsers.remove(&summary.flow_id) {
                     for evt in parser.finish() {
-                        emit_http_event(evt, detected_services.get(&summary.flow_id).cloned(), &matcher_tx, &segments, &metadata_tx, &metrics);
+                        emit_http_event(
+                            evt,
+                            detected_services.get(&summary.flow_id).cloned(),
+                            &matcher_tx,
+                            &segments,
+                            &metadata_tx,
+                            &metrics,
+                        );
                     }
                 }
                 summary.service = detected_services.remove(&summary.flow_id).or_else(|| {
                     let a = summary.src_port;
                     let b = summary.dst_port;
-                    services.by_port(a).or_else(|| services.by_port(b)).map(|service| service.name)
+                    services
+                        .by_port(a)
+                        .or_else(|| services.by_port(b))
+                        .map(|service| service.name)
                 });
                 let flow_id = summary.flow_id;
-                if metadata_tx.send(MetadataEvent::Flow(summary)).is_err() { break; }
-                if matcher_tx.send(MatchInput::FlowClosed(flow_id)).is_err() { break; }
+                if metadata_tx.send(MetadataEvent::Flow(summary)).is_err() {
+                    break;
+                }
+                // FlowClosed is recoverable housekeeping.  If the matcher is
+                // overloaded its bounded tail cache has an independent expiry;
+                // never let this analytical notification stop L7.
+                let _ = matcher_tx.try_send(MatchInput::FlowClosed(flow_id));
             }
         }
     }
 }
 
-fn fanout_content(record: ContentRecord, matcher_tx: &MatcherIngress, segments: &SegmentStore, _metrics: &Metrics) {
-    // Avoid even the cheap Bytes/metadata clone when no active rule can consume
-    // this content view. MatcherIngress repeats the atomic check before enqueue
-    // so pattern-generation changes remain safe across this boundary.
-    if matcher_tx.is_interested_view(record.view) {
-        match matcher_tx.send(MatchInput::Content(record.clone())) {
-            Ok(_) => {},
-            Err(_) => {
-                tracing::warn!(content_id=%record.id, "live matcher stopped");
-            }
-        }
-    }
+fn fanout_content(
+    record: ContentRecord,
+    matcher_tx: &MatcherIngress,
+    segments: &SegmentStore,
+    _metrics: &Metrics,
+) {
+    // Storage acceptance has higher priority than analytical latency. A slow
+    // matcher must never prevent an accepted payload from entering the durable
+    // segment pipeline; missed live work can be recovered by historical replay.
+    let match_copy = matcher_tx
+        .is_interested_view(record.view)
+        .then(|| record.clone());
     if let Err(e) = segments.append(record) {
         tracing::error!(error=%e, "content segment writer stopped");
+        return;
     }
+    let Some(record) = match_copy else {
+        return;
+    };
+    let _ = matcher_tx.try_send(MatchInput::Content(record));
 }
 
 fn emit_http_event(
@@ -310,8 +405,11 @@ fn emit_http_event(
         fanout_content(record, matcher_tx, segments, metrics);
     }
     if let Some(meta) = evt.meta.take() {
-        if meta.request { metrics.http_requests.fetch_add(1, Ordering::Relaxed); }
-        else { metrics.http_responses.fetch_add(1, Ordering::Relaxed); }
+        if meta.request {
+            metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.http_responses.fetch_add(1, Ordering::Relaxed);
+        }
         if metadata_tx.send(MetadataEvent::Http(meta)).is_err() {
             tracing::warn!("metadata writer stopped while emitting HTTP metadata");
         }
@@ -322,10 +420,17 @@ const HTTP_PENDING_REQUEST_LIMIT: usize = 4096;
 const HTTP_RESYNC_SUFFIX: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpMode { Http, Tunnel }
+enum HttpMode {
+    Http,
+    Tunnel,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestKind { Other, Head, Connect }
+enum RequestKind {
+    Other,
+    Head,
+    Connect,
+}
 
 impl RequestKind {
     #[inline]
@@ -406,8 +511,16 @@ struct HttpStreamParser {
 #[derive(Debug)]
 enum BodyState {
     Headers,
-    Fixed { remaining: u64, info: MessageInfo, compressed: Vec<u8> },
-    SkipFixed { remaining: u64, capture_remaining: usize, info: MessageInfo },
+    Fixed {
+        remaining: u64,
+        info: MessageInfo,
+        compressed: Vec<u8>,
+    },
+    SkipFixed {
+        remaining: u64,
+        capture_remaining: usize,
+        info: MessageInfo,
+    },
     Chunked {
         info: MessageInfo,
         decoder: ChunkedDecoder,
@@ -435,7 +548,11 @@ struct MessageInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Encoding { Identity, Gzip, Deflate }
+enum Encoding {
+    Identity,
+    Gzip,
+    Deflate,
+}
 
 struct HttpEmission {
     content: Vec<ContentRecord>,
@@ -503,7 +620,8 @@ impl HttpStreamParser {
                         break;
                     }
 
-                    let Some(end) = find_double_crlf_from(&self.buffer, self.header_scan_from) else {
+                    let Some(end) = find_double_crlf_from(&self.buffer, self.header_scan_from)
+                    else {
                         if self.buffer.len() > self.cfg.http_max_header_bytes {
                             report.parse_errors = report.parse_errors.saturating_add(1);
                             self.synced = false;
@@ -550,7 +668,8 @@ impl HttpStreamParser {
                         pending_requests.front().copied()
                     };
                     let status = parsed.status;
-                    let informational = !parsed.request && matches!(status, Some(100..=199)) && status != Some(101);
+                    let informational =
+                        !parsed.request && matches!(status, Some(100..=199)) && status != Some(101);
                     if parsed.request {
                         if pending_requests.len() >= HTTP_PENDING_REQUEST_LIMIT {
                             pending_requests.pop_front();
@@ -558,13 +677,14 @@ impl HttpStreamParser {
                         }
                         // Response framing only needs HEAD/CONNECT semantics;
                         // avoid a second String allocation for every request.
-                        pending_requests.push_back(RequestKind::from_method(parsed.method.as_deref()));
+                        pending_requests
+                            .push_back(RequestKind::from_method(parsed.method.as_deref()));
                     } else if !informational {
                         pending_requests.pop_front();
                     }
 
-                    let response_to_head = !parsed.request
-                        && response_kind == Some(RequestKind::Head);
+                    let response_to_head =
+                        !parsed.request && response_kind == Some(RequestKind::Head);
                     let connect_tunnel = !parsed.request
                         && response_kind == Some(RequestKind::Connect)
                         && matches!(status, Some(200..=299));
@@ -572,9 +692,21 @@ impl HttpStreamParser {
                     let no_body_status = !parsed.request
                         && matches!(status, Some(100..=199) | Some(204) | Some(205) | Some(304));
 
-                    let header_view = if parsed.request { ContentView::HttpRequestHeaders } else { ContentView::HttpResponseHeaders };
-                    let body_view = if parsed.request { ContentView::HttpRequestBody } else { ContentView::HttpResponseBody };
-                    let decoded_view = if parsed.request { ContentView::HttpRequestDecodedBody } else { ContentView::HttpResponseDecodedBody };
+                    let header_view = if parsed.request {
+                        ContentView::HttpRequestHeaders
+                    } else {
+                        ContentView::HttpResponseHeaders
+                    };
+                    let body_view = if parsed.request {
+                        ContentView::HttpRequestBody
+                    } else {
+                        ContentView::HttpResponseBody
+                    };
+                    let decoded_view = if parsed.request {
+                        ContentView::HttpRequestDecodedBody
+                    } else {
+                        ContentView::HttpResponseDecodedBody
+                    };
                     let info = MessageInfo {
                         flow_id: chunk.flow_id,
                         ts_ns: chunk.ts_ns,
@@ -625,7 +757,9 @@ impl HttpStreamParser {
 
                     let no_body = no_body_status || response_to_head;
                     self.state = if no_body
-                        || (parsed.request && !parsed.has_transfer_encoding && parsed.content_length.is_none())
+                        || (parsed.request
+                            && !parsed.has_transfer_encoding
+                            && parsed.content_length.is_none())
                     {
                         BodyState::Headers
                     } else if parsed.has_transfer_encoding {
@@ -664,7 +798,11 @@ impl HttpStreamParser {
                                 info,
                             }
                         } else {
-                            BodyState::Fixed { remaining: len, info, compressed: Vec::new() }
+                            BodyState::Fixed {
+                                remaining: len,
+                                info,
+                                compressed: Vec::new(),
+                            }
                         }
                     } else {
                         BodyState::UntilClose {
@@ -675,15 +813,24 @@ impl HttpStreamParser {
                         }
                     };
                 }
-                BodyState::Fixed { mut remaining, info, mut compressed } => {
+                BodyState::Fixed {
+                    mut remaining,
+                    info,
+                    mut compressed,
+                } => {
                     if self.buffer.is_empty() {
-                        self.state = BodyState::Fixed { remaining, info, compressed };
+                        self.state = BodyState::Fixed {
+                            remaining,
+                            info,
+                            compressed,
+                        };
                         break;
                     }
                     let take = (remaining.min(self.buffer.len() as u64)) as usize;
                     let data = self.buffer.split_to(take).freeze();
                     if info.encoding != Encoding::Identity
-                        && compressed.len().saturating_add(data.len()) <= self.cfg.http_max_decode_bytes
+                        && compressed.len().saturating_add(data.len())
+                            <= self.cfg.http_max_decode_bytes
                     {
                         compressed.extend_from_slice(&data);
                     }
@@ -696,18 +843,40 @@ impl HttpStreamParser {
                         request_direction: Some(info.request_direction),
                     });
                     if remaining == 0 {
-                        if let Some(record) = decoded_record(&info, self.stream_offset, &mut compressed, self.cfg.http_max_decode_bytes) {
-                            report.events.push(HttpEmission { content: vec![record], meta: None, request_direction: Some(info.request_direction) });
+                        if let Some(record) = decoded_record(
+                            &info,
+                            self.stream_offset,
+                            &mut compressed,
+                            self.cfg.http_max_decode_bytes,
+                            self.cfg.http_max_decode_ratio,
+                        ) {
+                            report.events.push(HttpEmission {
+                                content: vec![record],
+                                meta: None,
+                                request_direction: Some(info.request_direction),
+                            });
                         }
                         self.state = BodyState::Headers;
                     } else {
-                        self.state = BodyState::Fixed { remaining, info, compressed };
+                        self.state = BodyState::Fixed {
+                            remaining,
+                            info,
+                            compressed,
+                        };
                         break;
                     }
                 }
-                BodyState::SkipFixed { mut remaining, mut capture_remaining, info } => {
+                BodyState::SkipFixed {
+                    mut remaining,
+                    mut capture_remaining,
+                    info,
+                } => {
                     if self.buffer.is_empty() {
-                        self.state = BodyState::SkipFixed { remaining, capture_remaining, info };
+                        self.state = BodyState::SkipFixed {
+                            remaining,
+                            capture_remaining,
+                            info,
+                        };
                         break;
                     }
                     let take = (remaining.min(self.buffer.len() as u64)) as usize;
@@ -727,13 +896,29 @@ impl HttpStreamParser {
                     if remaining == 0 {
                         self.state = BodyState::Headers;
                     } else {
-                        self.state = BodyState::SkipFixed { remaining, capture_remaining, info };
+                        self.state = BodyState::SkipFixed {
+                            remaining,
+                            capture_remaining,
+                            info,
+                        };
                         break;
                     }
                 }
-                BodyState::Chunked { info, mut decoder, mut compressed, mut body_seen, mut capture_body } => {
+                BodyState::Chunked {
+                    info,
+                    mut decoder,
+                    mut compressed,
+                    mut body_seen,
+                    mut capture_body,
+                } => {
                     if self.buffer.is_empty() {
-                        self.state = BodyState::Chunked { info, decoder, compressed, body_seen, capture_body };
+                        self.state = BodyState::Chunked {
+                            info,
+                            decoder,
+                            compressed,
+                            body_seen,
+                            capture_body,
+                        };
                         break;
                     }
                     let before = self.buffer.len();
@@ -743,18 +928,28 @@ impl HttpStreamParser {
                     } else {
                         0
                     };
-                    match decoder.consume(&mut self.buffer, self.cfg.http_max_header_bytes, collect_remaining) {
+                    match decoder.consume(
+                        &mut self.buffer,
+                        self.cfg.http_max_header_bytes,
+                        collect_remaining,
+                    ) {
                         Ok(result) => {
                             for chunk_data in result.data_chunks {
                                 let data_len = chunk_data.data.len();
-                                let record_offset = base_offset.saturating_add(chunk_data.relative_offset as u64);
+                                let record_offset =
+                                    base_offset.saturating_add(chunk_data.relative_offset as u64);
                                 if info.encoding != Encoding::Identity
-                                    && compressed.len().saturating_add(data_len) <= self.cfg.http_max_decode_bytes
+                                    && compressed.len().saturating_add(data_len)
+                                        <= self.cfg.http_max_decode_bytes
                                 {
                                     compressed.extend_from_slice(&chunk_data.data);
                                 }
                                 report.events.push(HttpEmission {
-                                    content: vec![body_record(&info, record_offset, chunk_data.data)],
+                                    content: vec![body_record(
+                                        &info,
+                                        record_offset,
+                                        chunk_data.data,
+                                    )],
                                     meta: None,
                                     request_direction: Some(info.request_direction),
                                 });
@@ -763,18 +958,38 @@ impl HttpStreamParser {
                             if body_seen > self.cfg.http_max_body_bytes {
                                 capture_body = false;
                             }
-                            self.stream_offset = self.stream_offset.saturating_add(result.wire_consumed as u64);
+                            self.stream_offset = self
+                                .stream_offset
+                                .saturating_add(result.wire_consumed as u64);
                             if result.done {
                                 if capture_body {
-                                    if let Some(record) = decoded_record(&info, self.stream_offset, &mut compressed, self.cfg.http_max_decode_bytes) {
-                                        report.events.push(HttpEmission { content: vec![record], meta: None, request_direction: Some(info.request_direction) });
+                                    if let Some(record) = decoded_record(
+                                        &info,
+                                        self.stream_offset,
+                                        &mut compressed,
+                                        self.cfg.http_max_decode_bytes,
+                                        self.cfg.http_max_decode_ratio,
+                                    ) {
+                                        report.events.push(HttpEmission {
+                                            content: vec![record],
+                                            meta: None,
+                                            request_direction: Some(info.request_direction),
+                                        });
                                     }
                                 }
                                 self.state = BodyState::Headers;
                             } else {
                                 let made_progress = self.buffer.len() != before;
-                                self.state = BodyState::Chunked { info, decoder, compressed, body_seen, capture_body };
-                                if !made_progress { break; }
+                                self.state = BodyState::Chunked {
+                                    info,
+                                    decoder,
+                                    compressed,
+                                    body_seen,
+                                    capture_body,
+                                };
+                                if !made_progress {
+                                    break;
+                                }
                             }
                         }
                         Err(_) => {
@@ -787,9 +1002,19 @@ impl HttpStreamParser {
                         }
                     }
                 }
-                BodyState::UntilClose { info, mut compressed, mut body_seen, mut capture_body } => {
+                BodyState::UntilClose {
+                    info,
+                    mut compressed,
+                    mut body_seen,
+                    mut capture_body,
+                } => {
                     if self.buffer.is_empty() {
-                        self.state = BodyState::UntilClose { info, compressed, body_seen, capture_body };
+                        self.state = BodyState::UntilClose {
+                            info,
+                            compressed,
+                            body_seen,
+                            capture_body,
+                        };
                         break;
                     }
                     let data = self.buffer.split().freeze();
@@ -802,7 +1027,8 @@ impl HttpStreamParser {
                     if collect != 0 {
                         let captured = data.slice(..collect);
                         if info.encoding != Encoding::Identity
-                            && compressed.len().saturating_add(captured.len()) <= self.cfg.http_max_decode_bytes
+                            && compressed.len().saturating_add(captured.len())
+                                <= self.cfg.http_max_decode_bytes
                         {
                             compressed.extend_from_slice(&captured);
                         }
@@ -817,7 +1043,12 @@ impl HttpStreamParser {
                         capture_body = false;
                     }
                     self.stream_offset = self.stream_offset.saturating_add(data_len as u64);
-                    self.state = BodyState::UntilClose { info, compressed, body_seen, capture_body };
+                    self.state = BodyState::UntilClose {
+                        info,
+                        compressed,
+                        body_seen,
+                        capture_body,
+                    };
                     break;
                 }
             }
@@ -829,7 +1060,12 @@ impl HttpStreamParser {
         let mut out = Vec::new();
         let state = std::mem::replace(&mut self.state, BodyState::Headers);
         match state {
-            BodyState::UntilClose { info, mut compressed, body_seen, capture_body } => {
+            BodyState::UntilClose {
+                info,
+                mut compressed,
+                body_seen,
+                capture_body,
+            } => {
                 let mut final_capture = capture_body;
                 if !self.buffer.is_empty() {
                     let data = self.buffer.split().freeze();
@@ -842,7 +1078,8 @@ impl HttpStreamParser {
                     if collect != 0 {
                         let captured = data.slice(..collect);
                         if info.encoding != Encoding::Identity
-                            && compressed.len().saturating_add(captured.len()) <= self.cfg.http_max_decode_bytes
+                            && compressed.len().saturating_add(captured.len())
+                                <= self.cfg.http_max_decode_bytes
                         {
                             compressed.extend_from_slice(&captured);
                         }
@@ -852,21 +1089,37 @@ impl HttpStreamParser {
                             request_direction: Some(info.request_direction),
                         });
                     }
-                    final_capture &= body_seen.saturating_add(data_len) <= self.cfg.http_max_body_bytes;
+                    final_capture &=
+                        body_seen.saturating_add(data_len) <= self.cfg.http_max_body_bytes;
                     self.stream_offset = self.stream_offset.saturating_add(data_len as u64);
                 }
                 if final_capture {
-                    if let Some(record) = decoded_record(&info, self.stream_offset, &mut compressed, self.cfg.http_max_decode_bytes) {
-                        out.push(HttpEmission { content: vec![record], meta: None, request_direction: Some(info.request_direction) });
+                    if let Some(record) = decoded_record(
+                        &info,
+                        self.stream_offset,
+                        &mut compressed,
+                        self.cfg.http_max_decode_bytes,
+                        self.cfg.http_max_decode_ratio,
+                    ) {
+                        out.push(HttpEmission {
+                            content: vec![record],
+                            meta: None,
+                            request_direction: Some(info.request_direction),
+                        });
                     }
                 }
             }
-            BodyState::Fixed { remaining, info, mut compressed } => {
+            BodyState::Fixed {
+                remaining,
+                info,
+                mut compressed,
+            } => {
                 let take = (remaining.min(self.buffer.len() as u64)) as usize;
                 if take > 0 {
                     let data = self.buffer.split_to(take).freeze();
                     if info.encoding != Encoding::Identity
-                        && compressed.len().saturating_add(data.len()) <= self.cfg.http_max_decode_bytes
+                        && compressed.len().saturating_add(data.len())
+                            <= self.cfg.http_max_decode_bytes
                     {
                         compressed.extend_from_slice(&data);
                     }
@@ -878,13 +1131,27 @@ impl HttpStreamParser {
                     self.stream_offset = self.stream_offset.saturating_add(take as u64);
                 }
                 if take as u64 == remaining {
-                    if let Some(record) = decoded_record(&info, self.stream_offset, &mut compressed, self.cfg.http_max_decode_bytes) {
-                        out.push(HttpEmission { content: vec![record], meta: None, request_direction: Some(info.request_direction) });
+                    if let Some(record) = decoded_record(
+                        &info,
+                        self.stream_offset,
+                        &mut compressed,
+                        self.cfg.http_max_decode_bytes,
+                        self.cfg.http_max_decode_ratio,
+                    ) {
+                        out.push(HttpEmission {
+                            content: vec![record],
+                            meta: None,
+                            request_direction: Some(info.request_direction),
+                        });
                     }
                 }
                 self.buffer.clear();
             }
-            BodyState::SkipFixed { remaining, capture_remaining, info } => {
+            BodyState::SkipFixed {
+                remaining,
+                capture_remaining,
+                info,
+            } => {
                 let take = (remaining.min(self.buffer.len() as u64)) as usize;
                 if take != 0 {
                     let wire = self.buffer.split_to(take).freeze();
@@ -901,33 +1168,62 @@ impl HttpStreamParser {
                 }
                 self.buffer.clear();
             }
-            BodyState::Chunked { info, mut decoder, mut compressed, mut body_seen, mut capture_body } => {
+            BodyState::Chunked {
+                info,
+                mut decoder,
+                mut compressed,
+                mut body_seen,
+                mut capture_body,
+            } => {
                 let collect_remaining = if capture_body {
                     self.cfg.http_max_body_bytes.saturating_sub(body_seen)
                 } else {
                     0
                 };
-                if let Ok(result) = decoder.consume(&mut self.buffer, self.cfg.http_max_header_bytes, collect_remaining) {
+                if let Ok(result) = decoder.consume(
+                    &mut self.buffer,
+                    self.cfg.http_max_header_bytes,
+                    collect_remaining,
+                ) {
                     let base_offset = self.stream_offset;
                     for chunk_data in result.data_chunks {
                         let len = chunk_data.data.len();
                         if info.encoding != Encoding::Identity
-                            && compressed.len().saturating_add(len) <= self.cfg.http_max_decode_bytes
+                            && compressed.len().saturating_add(len)
+                                <= self.cfg.http_max_decode_bytes
                         {
                             compressed.extend_from_slice(&chunk_data.data);
                         }
                         out.push(HttpEmission {
-                            content: vec![body_record(&info, base_offset + chunk_data.relative_offset as u64, chunk_data.data)],
+                            content: vec![body_record(
+                                &info,
+                                base_offset + chunk_data.relative_offset as u64,
+                                chunk_data.data,
+                            )],
                             meta: None,
                             request_direction: Some(info.request_direction),
                         });
                     }
                     body_seen = body_seen.saturating_add(result.body_bytes);
-                    if body_seen > self.cfg.http_max_body_bytes { capture_body = false; }
-                    self.stream_offset = self.stream_offset.saturating_add(result.wire_consumed as u64);
+                    if body_seen > self.cfg.http_max_body_bytes {
+                        capture_body = false;
+                    }
+                    self.stream_offset = self
+                        .stream_offset
+                        .saturating_add(result.wire_consumed as u64);
                     if result.done && capture_body {
-                        if let Some(record) = decoded_record(&info, self.stream_offset, &mut compressed, self.cfg.http_max_decode_bytes) {
-                            out.push(HttpEmission { content: vec![record], meta: None, request_direction: Some(info.request_direction) });
+                        if let Some(record) = decoded_record(
+                            &info,
+                            self.stream_offset,
+                            &mut compressed,
+                            self.cfg.http_max_decode_bytes,
+                            self.cfg.http_max_decode_ratio,
+                        ) {
+                            out.push(HttpEmission {
+                                content: vec![record],
+                                meta: None,
+                                request_direction: Some(info.request_direction),
+                            });
                         }
                     }
                 }
@@ -963,23 +1259,65 @@ impl HttpStreamParser {
 }
 
 fn body_record(info: &MessageInfo, offset: u64, data: Bytes) -> ContentRecord {
-    ContentRecord { id:Uuid::new_v4(), flow_id:info.flow_id, ts_ns:info.ts_ns, service:None, direction:info.direction, view:info.body_view, stream_offset:offset, data }
+    ContentRecord {
+        id: Uuid::new_v4(),
+        flow_id: info.flow_id,
+        ts_ns: info.ts_ns,
+        service: None,
+        direction: info.direction,
+        view: info.body_view,
+        stream_offset: offset,
+        data,
+    }
 }
 
-fn decoded_record(info:&MessageInfo, offset:u64, compressed:&mut Vec<u8>, limit:usize)->Option<ContentRecord>{
-    if info.encoding == Encoding::Identity || compressed.is_empty() { return None; }
+fn decoded_record(
+    info: &MessageInfo,
+    offset: u64,
+    compressed: &mut Vec<u8>,
+    absolute_limit: usize,
+    max_ratio: usize,
+) -> Option<ContentRecord> {
+    if info.encoding == Encoding::Identity || compressed.is_empty() {
+        return None;
+    }
     let data = std::mem::take(compressed);
+    let ratio_limit = data.len().saturating_mul(max_ratio);
+    let limit = absolute_limit.min(ratio_limit);
+    if limit == 0 {
+        return None;
+    }
     let decoded = match info.encoding {
         Encoding::Gzip => read_bounded(GzDecoder::new(data.as_slice()), limit),
         Encoding::Deflate => read_bounded(ZlibDecoder::new(data.as_slice()), limit),
         Encoding::Identity => return None,
-    }.ok()?;
-    Some(ContentRecord{id:Uuid::new_v4(),flow_id:info.flow_id,ts_ns:info.ts_ns,service:None,direction:info.direction,view:info.decoded_view,stream_offset:offset,data:bytes::Bytes::from(decoded)})
+    }
+    .ok()?;
+    Some(ContentRecord {
+        id: Uuid::new_v4(),
+        flow_id: info.flow_id,
+        ts_ns: info.ts_ns,
+        service: None,
+        direction: info.direction,
+        view: info.decoded_view,
+        stream_offset: offset,
+        data: bytes::Bytes::from(decoded),
+    })
 }
 
-fn read_bounded<R:Read>(mut r:R, limit:usize)->Result<Vec<u8>>{
-    let mut out=Vec::new(); let mut buf=[0u8;8192];
-    loop { let n=r.read(&mut buf)?; if n==0{break;} if out.len().saturating_add(n)>limit{bail!("decompressed body limit exceeded");} out.extend_from_slice(&buf[..n]); }
+fn read_bounded<R: Read>(mut reader: R, limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if out.len().saturating_add(read) > limit {
+            bail!("decompressed body limit exceeded");
+        }
+        out.extend_from_slice(&buffer[..read]);
+    }
     Ok(out)
 }
 
@@ -1005,14 +1343,20 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader> {
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let (request, method, path, status, parsed_headers) = if bytes.starts_with(b"HTTP/") {
         let mut response = httparse::Response::new(&mut headers);
-        if response.parse(bytes)?.is_partial() { bail!("partial HTTP response header"); }
+        if response.parse(bytes)?.is_partial() {
+            bail!("partial HTTP response header");
+        }
         (false, None, None, response.code, response.headers)
     } else {
         let mut request = httparse::Request::new(&mut headers);
-        if request.parse(bytes)?.is_partial() { bail!("partial HTTP request header"); }
+        if request.parse(bytes)?.is_partial() {
+            bail!("partial HTTP request header");
+        }
         let method = request.method.map(str::to_owned);
         let path = request.path.map(str::to_owned);
-        if method.is_none() || path.is_none() { bail!("invalid HTTP request line"); }
+        if method.is_none() || path.is_none() {
+            bail!("invalid HTTP request line");
+        }
         (true, method, path, None, request.headers)
     };
 
@@ -1020,7 +1364,8 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader> {
     let user_agent = header_text(parsed_headers, "user-agent");
     let content_type = header_text(parsed_headers, "content-type");
     let content_length = parse_content_length(parsed_headers)?;
-    let (has_transfer_encoding, transfer_final_chunked) = transfer_encoding_framing(parsed_headers)?;
+    let (has_transfer_encoding, transfer_final_chunked) =
+        transfer_encoding_framing(parsed_headers)?;
     let ambiguous_framing = has_transfer_encoding && content_length.is_some();
 
     let encoding = match header_bytes(parsed_headers, "content-encoding") {
@@ -1040,7 +1385,11 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader> {
         // RFC 9112: Transfer-Encoding overrides Content-Length for framing.
         // Keeping the CL out of the decision also prevents CL/TE smuggling
         // differentials inside the analyzer.
-        content_length: if has_transfer_encoding { None } else { content_length },
+        content_length: if has_transfer_encoding {
+            None
+        } else {
+            content_length
+        },
         has_transfer_encoding,
         transfer_final_chunked,
         ambiguous_framing,
@@ -1050,8 +1399,12 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader> {
 
 fn parse_content_length(headers: &[httparse::Header<'_>]) -> Result<Option<u64>> {
     let mut value = None::<u64>;
-    for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-length")) {
-        let text = std::str::from_utf8(h.value).map_err(|_| anyhow::anyhow!("invalid Content-Length encoding"))?;
+    for h in headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+    {
+        let text = std::str::from_utf8(h.value)
+            .map_err(|_| anyhow::anyhow!("invalid Content-Length encoding"))?;
         // RFC permits a repeated/comma-joined field only when all decimal
         // values are identical. Anything else is ambiguous framing.
         for token in text.split(',') {
@@ -1059,7 +1412,9 @@ fn parse_content_length(headers: &[httparse::Header<'_>]) -> Result<Option<u64>>
             if token.is_empty() || !token.as_bytes().iter().all(|b| b.is_ascii_digit()) {
                 bail!("invalid Content-Length value");
             }
-            let parsed = token.parse::<u64>().map_err(|_| anyhow::anyhow!("Content-Length overflow"))?;
+            let parsed = token
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("Content-Length overflow"))?;
             match value {
                 Some(existing) if existing != parsed => bail!("conflicting Content-Length values"),
                 Some(_) => {}
@@ -1073,7 +1428,10 @@ fn parse_content_length(headers: &[httparse::Header<'_>]) -> Result<Option<u64>>
 fn transfer_encoding_framing(headers: &[httparse::Header<'_>]) -> Result<(bool, bool)> {
     let mut seen_any = false;
     let mut final_chunked = false;
-    for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("transfer-encoding")) {
+    for h in headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
         let text = std::str::from_utf8(h.value)
             .map_err(|_| anyhow::anyhow!("invalid Transfer-Encoding"))?;
         for raw in text.split(',') {
@@ -1094,7 +1452,10 @@ fn transfer_encoding_framing(headers: &[httparse::Header<'_>]) -> Result<(bool, 
 }
 
 fn header_bytes<'h, 'b>(headers: &'h [httparse::Header<'b>], name: &str) -> Option<&'b [u8]> {
-    headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value)
 }
 
 fn header_text(headers: &[httparse::Header<'_>], name: &str) -> Option<String> {
@@ -1102,8 +1463,12 @@ fn header_text(headers: &[httparse::Header<'_>], name: &str) -> Option<String> {
 }
 
 fn ascii_contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() { return true; }
-    haystack.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[derive(Default, Debug)]
@@ -1113,7 +1478,13 @@ struct ChunkedDecoder {
 }
 
 #[derive(Default, Debug)]
-enum ChunkState { #[default] Size, Data(usize), DataCrlf, Trailers }
+enum ChunkState {
+    #[default]
+    Size,
+    Data(usize),
+    DataCrlf,
+    Trailers,
+}
 
 struct ChunkData {
     relative_offset: usize,
@@ -1128,7 +1499,12 @@ struct ChunkConsume {
 }
 
 impl ChunkedDecoder {
-    fn consume(&mut self, buf: &mut BytesMut, max_line: usize, max_collect: usize) -> Result<ChunkConsume> {
+    fn consume(
+        &mut self,
+        buf: &mut BytesMut,
+        max_line: usize,
+        max_collect: usize,
+    ) -> Result<ChunkConsume> {
         let initial_len = buf.len();
         let mut chunks = Vec::new();
         let mut collected = 0usize;
@@ -1138,39 +1514,65 @@ impl ChunkedDecoder {
             match self.state {
                 ChunkState::Size => {
                     let Some(pos) = find_crlf_from(buf, self.scan_from) else {
-                        if buf.len() > max_line { bail!("chunk-size line limit exceeded"); }
+                        if buf.len() > max_line {
+                            bail!("chunk-size line limit exceeded");
+                        }
                         self.scan_from = buf.len().saturating_sub(1);
                         break;
                     };
                     self.scan_from = 0;
                     let line = buf.split_to(pos + 2);
                     let s = std::str::from_utf8(&line[..pos])?
-                        .split(';').next().unwrap_or("").trim();
-                    if s.is_empty() || s.len() > 16 { bail!("bad chunk size"); }
-                    let n = usize::from_str_radix(s, 16).map_err(|_| anyhow::anyhow!("bad chunk size"))?;
-                    if n == 0 { self.state = ChunkState::Trailers; }
-                    else { self.state = ChunkState::Data(n); }
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if s.is_empty() || s.len() > 16 {
+                        bail!("bad chunk size");
+                    }
+                    let n = usize::from_str_radix(s, 16)
+                        .map_err(|_| anyhow::anyhow!("bad chunk size"))?;
+                    if n == 0 {
+                        self.state = ChunkState::Trailers;
+                    } else {
+                        self.state = ChunkState::Data(n);
+                    }
                 }
                 ChunkState::Data(mut remaining) => {
-                    if buf.is_empty() { break; }
+                    if buf.is_empty() {
+                        break;
+                    }
                     let take = remaining.min(buf.len());
                     let relative_offset = initial_len.saturating_sub(buf.len());
                     let collect = take.min(max_collect.saturating_sub(collected));
                     if collect != 0 {
                         let data = buf.split_to(take).freeze();
-                        chunks.push(ChunkData { relative_offset, data: data.slice(..collect) });
+                        chunks.push(ChunkData {
+                            relative_offset,
+                            data: data.slice(..collect),
+                        });
                         collected = collected.saturating_add(collect);
                     } else {
                         let _ = buf.split_to(take);
                     }
                     body_bytes = body_bytes.saturating_add(take);
                     remaining -= take;
-                    self.state = if remaining == 0 { ChunkState::DataCrlf } else { ChunkState::Data(remaining) };
-                    if remaining != 0 { break; }
+                    self.state = if remaining == 0 {
+                        ChunkState::DataCrlf
+                    } else {
+                        ChunkState::Data(remaining)
+                    };
+                    if remaining != 0 {
+                        break;
+                    }
                 }
                 ChunkState::DataCrlf => {
-                    if buf.len() < 2 { break; }
-                    if &buf[..2] != b"\r\n" { bail!("missing chunk CRLF"); }
+                    if buf.len() < 2 {
+                        break;
+                    }
+                    if &buf[..2] != b"\r\n" {
+                        bail!("missing chunk CRLF");
+                    }
                     let _ = buf.split_to(2);
                     self.state = ChunkState::Size;
                 }
@@ -1183,7 +1585,9 @@ impl ChunkedDecoder {
                         break;
                     }
                     let Some(pos) = find_double_crlf_from(buf, self.scan_from) else {
-                        if buf.len() > max_line { bail!("chunk trailer limit exceeded"); }
+                        if buf.len() > max_line {
+                            bail!("chunk trailer limit exceeded");
+                        }
                         self.scan_from = buf.len().saturating_sub(3);
                         break;
                     };
@@ -1205,15 +1609,25 @@ impl ChunkedDecoder {
 }
 
 fn find_crlf_from(v: &[u8], from: usize) -> Option<usize> {
-    if v.len() < 2 { return None; }
+    if v.len() < 2 {
+        return None;
+    }
     let start = from.min(v.len().saturating_sub(1));
-    v[start..].windows(2).position(|w| w == b"\r\n").map(|p| start + p)
+    v[start..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| start + p)
 }
 
 fn find_double_crlf_from(v: &[u8], from: usize) -> Option<usize> {
-    if v.len() < 4 { return None; }
+    if v.len() < 4 {
+        return None;
+    }
     let start = from.min(v.len().saturating_sub(3));
-    v[start..].windows(4).position(|w| w == b"\r\n\r\n").map(|p| start + p)
+    v[start..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| start + p)
 }
 
 fn find_plausible_http_start(v: &[u8]) -> Option<usize> {
@@ -1242,13 +1656,21 @@ fn looks_like_http_start(v: &[u8]) -> bool {
     if v.starts_with(b"HTTP/") {
         return true;
     }
-    let Some(method_end) = v.iter().take(17).position(|b| *b == b' ') else { return false; };
-    if !(1..=16).contains(&method_end) { return false; }
+    let Some(method_end) = v.iter().take(17).position(|b| *b == b' ') else {
+        return false;
+    };
+    if !(1..=16).contains(&method_end) {
+        return false;
+    }
     let method = &v[..method_end];
-    if !method.iter().all(|b| b.is_ascii_uppercase() || *b == b'-') { return false; }
+    if !method.iter().all(|b| b.is_ascii_uppercase() || *b == b'-') {
+        return false;
+    }
 
     let rest = &v[method_end + 1..];
-    if rest.is_empty() { return false; }
+    if rest.is_empty() {
+        return false;
+    }
     if method == b"CONNECT" {
         return !rest[0].is_ascii_whitespace(); // authority-form candidate
     }
@@ -1258,7 +1680,10 @@ fn looks_like_http_start(v: &[u8]) -> bool {
         || rest.starts_with(b"https://")
 }
 
-fn ns_to_datetime(ns:u64)->DateTime<Utc>{DateTime::<Utc>::from_timestamp((ns/1_000_000_000) as i64,(ns%1_000_000_000) as u32).unwrap_or_else(Utc::now)}
+fn ns_to_datetime(ns: u64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
+        .unwrap_or_else(Utc::now)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1268,8 +1693,14 @@ mod tests {
 
     fn flow_key() -> FlowKey {
         FlowKey {
-            a: Endpoint { ip: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 1234 },
-            b: Endpoint { ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port: 80 },
+            a: Endpoint {
+                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 1234,
+            },
+            b: Endpoint {
+                ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                port: 80,
+            },
             protocol: TransportProtocol::Tcp,
             l2_domain: 0,
         }
@@ -1288,11 +1719,21 @@ mod tests {
     }
 
     fn request_metas(report: &HttpFeedReport) -> Vec<&HttpRecord> {
-        report.events.iter().filter_map(|e| e.meta.as_ref()).filter(|m| m.request).collect()
+        report
+            .events
+            .iter()
+            .filter_map(|e| e.meta.as_ref())
+            .filter(|m| m.request)
+            .collect()
     }
 
     fn response_metas(report: &HttpFeedReport) -> Vec<&HttpRecord> {
-        report.events.iter().filter_map(|e| e.meta.as_ref()).filter(|m| !m.request).collect()
+        report
+            .events
+            .iter()
+            .filter_map(|e| e.meta.as_ref())
+            .filter(|m| !m.request)
+            .collect()
     }
 
     #[test]
@@ -1306,9 +1747,11 @@ mod tests {
         assert_eq!(report.parse_errors, 0);
         let meta = request_metas(&report)[0];
         assert_eq!(meta.user_agent.as_deref(), Some("python-requests/2"));
-        assert!(report.events.iter().flat_map(|e| e.content.iter()).any(|c| {
-            c.view == ContentView::HttpRequestBody && c.data.as_ref() == b"hello"
-        }));
+        assert!(report
+            .events
+            .iter()
+            .flat_map(|e| e.content.iter())
+            .any(|c| { c.view == ContentView::HttpRequestBody && c.data.as_ref() == b"hello" }));
     }
 
     #[test]
@@ -1329,12 +1772,24 @@ mod tests {
     #[test]
     fn connect_switches_connection_to_tunnel() {
         let mut c = HttpConnection::new(Arc::new(test_cfg()));
-        let rq = c.feed(&chunk(Direction::AToB, 0, b"CONNECT host:443 HTTP/1.1\r\nHost: host\r\n\r\n"));
+        let rq = c.feed(&chunk(
+            Direction::AToB,
+            0,
+            b"CONNECT host:443 HTTP/1.1\r\nHost: host\r\n\r\n",
+        ));
         assert_eq!(request_metas(&rq).len(), 1);
-        let rs = c.feed(&chunk(Direction::BToA, 0, b"HTTP/1.1 200 Connection Established\r\n\r\n\x16\x03\x01garbage"));
+        let rs = c.feed(&chunk(
+            Direction::BToA,
+            0,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n\x16\x03\x01garbage",
+        ));
         assert_eq!(response_metas(&rs).len(), 1);
         assert_eq!(c.mode, HttpMode::Tunnel);
-        let later = c.feed(&chunk(Direction::BToA, 48, b"GET /not-http-inside-tunnel HTTP/1.1\r\n\r\n"));
+        let later = c.feed(&chunk(
+            Direction::BToA,
+            48,
+            b"GET /not-http-inside-tunnel HTTP/1.1\r\n\r\n",
+        ));
         assert!(later.events.is_empty());
         assert_eq!(later.parse_errors, 0);
     }
@@ -1351,7 +1806,9 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].path.as_deref(), Some("/big"));
         assert_eq!(metas[1].path.as_deref(), Some("/ok"));
-        let captured = r.events.iter()
+        let captured = r
+            .events
+            .iter()
             .flat_map(|e| e.content.iter())
             .filter(|c| c.view == ContentView::HttpRequestBody)
             .flat_map(|c| c.data.iter().copied())
@@ -1373,7 +1830,11 @@ mod tests {
     #[test]
     fn leading_tcp_gap_starts_http_parser_unsynchronized() {
         let mut c = HttpConnection::new(Arc::new(test_cfg()));
-        let r = c.feed(&chunk(Direction::AToB, 100, b"garbage\r\nGET /recovered HTTP/1.1\r\nHost: x\r\n\r\n"));
+        let r = c.feed(&chunk(
+            Direction::AToB,
+            100,
+            b"garbage\r\nGET /recovered HTTP/1.1\r\nHost: x\r\n\r\n",
+        ));
         assert_eq!(r.parse_errors, 0);
         let metas = request_metas(&r);
         assert_eq!(metas.len(), 1);
@@ -1399,11 +1860,19 @@ mod tests {
     #[test]
     fn tcp_offset_gap_forces_http_resync() {
         let mut c = HttpConnection::new(Arc::new(test_cfg()));
-        let first = c.feed(&chunk(Direction::AToB, 0, b"POST /lost HTTP/1.1\r\nContent-Length: 20\r\n\r\nabc"));
+        let first = c.feed(&chunk(
+            Direction::AToB,
+            0,
+            b"POST /lost HTTP/1.1\r\nContent-Length: 20\r\n\r\nabc",
+        ));
         assert_eq!(request_metas(&first).len(), 1);
         // Offset jumps over an inferred/forced capture gap. The new plausible start
         // must be treated as a fresh message rather than body continuation.
-        let second = c.feed(&chunk(Direction::AToB, 200, b"GET /recovered HTTP/1.1\r\nHost: x\r\n\r\n"));
+        let second = c.feed(&chunk(
+            Direction::AToB,
+            200,
+            b"GET /recovered HTTP/1.1\r\nHost: x\r\n\r\n",
+        ));
         assert_eq!(second.parse_errors, 0);
         let metas = request_metas(&second);
         assert_eq!(metas.len(), 1);
@@ -1414,17 +1883,25 @@ mod tests {
     fn duplicate_equal_content_length_is_allowed_but_conflict_is_not() {
         let ok = parse_header(b"POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n").unwrap();
         assert_eq!(ok.content_length, Some(5));
-        assert!(parse_header(b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n").is_err());
+        assert!(
+            parse_header(b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n")
+                .is_err()
+        );
     }
 
     #[test]
     fn transfer_encoding_requires_chunked_to_be_final() {
-        let p = parse_header(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 999\r\n\r\n").unwrap();
+        let p = parse_header(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 999\r\n\r\n",
+        )
+        .unwrap();
         assert!(p.has_transfer_encoding);
         assert!(p.transfer_final_chunked);
         assert!(p.ambiguous_framing);
         assert_eq!(p.content_length, None);
-        assert!(parse_header(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n").is_err());
+        assert!(
+            parse_header(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n").is_err()
+        );
     }
 
     #[test]
@@ -1439,7 +1916,9 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].path.as_deref(), Some("/big"));
         assert_eq!(metas[1].path.as_deref(), Some("/ok"));
-        let captured = r.events.iter()
+        let captured = r
+            .events
+            .iter()
             .flat_map(|e| e.content.iter())
             .filter(|c| c.view == ContentView::HttpRequestBody)
             .map(|c| c.data.len())
@@ -1452,7 +1931,11 @@ mod tests {
         let mut c = HttpConnection::new(Arc::new(test_cfg()));
         let first = c.feed(&chunk(Direction::AToB, 0, b"bad framing\r\n"));
         assert!(first.parse_errors >= 1 || first.events.is_empty());
-        let second = c.feed(&chunk(Direction::AToB, 100, b"junk\nCONNECT host:443 HTTP/1.1\r\nHost: host\r\n\r\n"));
+        let second = c.feed(&chunk(
+            Direction::AToB,
+            100,
+            b"junk\nCONNECT host:443 HTTP/1.1\r\nHost: host\r\n\r\n",
+        ));
         let metas = request_metas(&second);
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].method.as_deref(), Some("CONNECT"));
@@ -1516,6 +1999,10 @@ mod tests {
             flow_to_l7_capacity: 128,
             l7_to_match_capacity: 128,
             storage_capacity: 128,
+            segment_queue_capacity: 128,
+            metadata_spool_dir: "/tmp/bazalt-test-spool".into(),
+            metadata_spool_max_bytes: 1024 * 1024,
+            clickhouse_request_timeout: std::time::Duration::from_secs(1),
             flow_shards: 1,
             l7_workers: 1,
             matcher_workers: 1,
@@ -1524,6 +2011,8 @@ mod tests {
             udp_idle_timeout: std::time::Duration::from_secs(1),
             live_flow_update_interval: std::time::Duration::from_millis(100),
             max_flow_bytes: 0,
+            max_active_flows: 1024,
+            max_flows_per_source_prefix: 128,
             max_ooo_bytes: 1024,
             max_ooo_segments: 128,
             ip_fragment_cache_bytes: 1024 * 1024,
@@ -1533,17 +2022,25 @@ mod tests {
             http_max_header_bytes: 128 * 1024,
             http_max_body_bytes: 1024 * 1024,
             http_max_decode_bytes: 1024 * 1024,
+            http_max_decode_ratio: 32,
             matcher_overlap_bytes: 1024,
+            matcher_max_hits_per_pattern: 128,
+            matcher_max_hits_per_record: 1024,
             segment_dir: "/tmp".into(),
             segment_max_bytes: 1024 * 1024,
+            segment_store_max_bytes: 16 * 1024 * 1024,
+            segment_max_record_bytes: 512 * 1024,
             raw_capture_enabled: false,
             raw_segment_dir: "/tmp".into(),
             postgres_url: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "x".into(),
+            clickhouse_username: None,
+            clickhouse_password: None,
             replay_workers: 1,
             replay_live_queue_pause_pct: 70,
             replay_poll_ms: 10,
+            worker_stall_timeout: std::time::Duration::from_secs(30),
             packet_logging: false,
             auth: crate::config::AuthConfig {
                 enabled: false,

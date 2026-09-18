@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 use anyhow::Result;
 use tracing_subscriber::{fmt, EnvFilter};
 

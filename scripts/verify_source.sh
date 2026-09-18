@@ -21,10 +21,12 @@ for path in ('docker-compose.yml', 'docker-compose.smoke.yml'):
 print('YAML PASS')
 PY
 
-if command -v cargo >/dev/null 2>&1; then
-  cargo fmt --check
-  cargo clippy --all-features --all-targets -- -D warnings
-  cargo test --all-features
-else
-  echo 'NOTE: cargo unavailable; Rust fmt/clippy/unit-test gate skipped.' >&2
+if ! command -v cargo >/dev/null 2>&1; then
+  echo 'ERROR: cargo is required for source verification; refusing to skip the Rust gate.' >&2
+  exit 2
 fi
+
+cargo fmt --check
+cargo clippy --all-features --all-targets -- -D warnings
+cargo test --all-features
+cargo build --release --all-features

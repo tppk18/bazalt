@@ -119,9 +119,31 @@ BAZALT_FLOW_QUEUE=16384
 BAZALT_MATCH_QUEUE=16384
 BAZALT_STORAGE_QUEUE=16384
 
+# ClickHouse is an asynchronous projection target. Accepted metadata is fsync'd
+# to this bounded local spool first; replay yields as the spool approaches its cap.
+BAZALT_METADATA_SPOOL_MAX_BYTES=2147483648
+BAZALT_CLICKHOUSE_TIMEOUT_MS=5000
+
+# HTTP decoded-body amplification bounds. Full streaming decode is still planned.
+BAZALT_HTTP_MAX_DECODE_BYTES=16777216
+BAZALT_HTTP_MAX_DECODE_RATIO=32
+
+# Global flow-state admission is checked only for previously unseen tuples.
+BAZALT_MAX_ACTIVE_FLOWS=262144
+# Match output/work amplification bounds.
+BAZALT_MATCH_MAX_HITS_PER_PATTERN=128
+BAZALT_MATCH_MAX_HITS_PER_RECORD=1024
+# Reject malformed segment lengths before allocation (must be <= segment size).
+BAZALT_SEGMENT_MAX_RECORD_BYTES=268435456
+
 BAZALT_LIVE_FLOW_UPDATE_MS=1000
 BAZALT_PACKET_LOGGING=false
 BAZALT_RAW_CAPTURE=false
+
+# Compose no longer ships known database passwords. Generate URL-safe secrets
+# (for example `openssl rand -hex 32`) before starting the stack.
+BAZALT_POSTGRES_PASSWORD=change-this-too
+BAZALT_CLICKHOUSE_PASSWORD=change-this-too
 
 # Control plane auth is enabled by default. Both credentials are required.
 BAZALT_AUTH_ENABLED=true
@@ -131,13 +153,17 @@ BAZALT_AUTH_PASSWORD=change-this
 # BAZALT_AUTH_ENABLED=false
 ```
 
-Для миграции с 0.1.x backend также принимает старые `PACKMATE_*` ключи, если соответствующий `BAZALT_*` не задан. Docker Compose 0.4.1 передаёт `BAZALT_*` как основные ключи и также пробрасывает legacy `PACKMATE_*`, поэтому существующий `.env` от 0.1.x продолжает работать.
+Для миграции с 0.1.x backend также принимает старые `PACKMATE_*` ключи, если соответствующий `BAZALT_*` не задан. Docker Compose 0.4.1.2 передаёт `BAZALT_*` как основные ключи и также пробрасывает legacy `PACKMATE_*`, поэтому существующий `.env` от 0.1.x продолжает работать.
 
 PostgreSQL/ClickHouse database namespace пока сохранён как `packmate` для бесшовного обновления существующих volumes. Это внутренний storage namespace, не имя продукта.
 
+В `0.4.1.2` PostgreSQL и ClickHouse публикуются на host только через `127.0.0.1`; native ClickHouse port наружу не публикуется. Это сохраняет доступ приложения с `network_mode: host`, но убирает обход HTTP-auth через прямое подключение к БД с game/hostile interface.
+
+ClickHouse не входит в synchronous acceptance path: metadata сначала попадает в bounded `data/metadata-spool`, после чего projector асинхронно догоняет ClickHouse. `bazalt_metadata_spool_bytes`/`bazalt_metadata_spool_capacity` позволяют видеть outage backlog. При заполнении spool metadata writer считается critical failure и supervisor завершает процесс вместо тихой частичной работы.
+
 ## Диагностика входящего capture
 
-`0.4.1` разделяет метрики source-level и accepted packet-level. По умолчанию `BAZALT_EARLY_PORT_FILTER=false`: libpcap не получает ранний BPF по портам, а обязательный userspace allow-list по настроенным сервисам остаётся активным. Это исключает ситуацию, когда несовместимость BPF/link-layer выглядит как полностью мёртвый capture.
+`0.4.1.2` разделяет метрики source-level и accepted packet-level. По умолчанию `BAZALT_EARLY_PORT_FILTER=false`: libpcap не получает ранний BPF по портам, а обязательный userspace allow-list по настроенным сервисам остаётся активным. Это исключает ситуацию, когда несовместимость BPF/link-layer выглядит как полностью мёртвый capture.
 
 Ключевые метрики:
 

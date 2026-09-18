@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 pub mod auth;
 pub mod affinity;
 pub mod api;
