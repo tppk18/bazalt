@@ -36,7 +36,7 @@ use crate::{
     storage::{
         clickhouse::ClickHouseStore, postgres::PostgresStore, segment::SegmentStore, MetadataSink,
     },
-    topology::{ThrottleManager, TopologyTracker},
+    topology::{ThrottleManager, TopologyTracker, MAX_THROTTLE_TTL_SECS},
 };
 
 #[derive(Clone)]
@@ -341,7 +341,6 @@ async fn resource_status(State(s): State<ApiState>) -> Json<serde_json::Value> {
 }
 
 const DEFAULT_THROTTLE_TTL_SECS: u64 = 300;
-const MAX_THROTTLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
 struct ThrottleRequest {
@@ -358,6 +357,7 @@ struct ClearThrottleRequest {
 async fn topology(State(s): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "traffic": s.topology.snapshot(),
+        "service_ports": s.services.ports(),
         "enforcement": s.throttle.snapshot(),
     }))
 }
@@ -368,7 +368,7 @@ async fn set_topology_throttle(
 ) -> ApiResult<Json<serde_json::Value>> {
     if !s.throttle.available() {
         return Err(ApiError::service_unavailable(
-            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_INTERFACE to the ingress/forwarding interface",
+            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_ENABLED=true (enforcement always uses BAZALT_INTERFACE)",
         ));
     }
     if !(1..=100).contains(&req.drop_percent) {
@@ -379,14 +379,14 @@ async fn set_topology_throttle(
         .canonical_throttle_target(&req.target)
         .map_err(|message| ApiError::bad_request(&message))?;
     let ttl_seconds = req.ttl_seconds.unwrap_or(DEFAULT_THROTTLE_TTL_SECS);
-    if ttl_seconds > MAX_THROTTLE_TTL_SECS {
+    if ttl_seconds == 0 || ttl_seconds > MAX_THROTTLE_TTL_SECS {
         return Err(ApiError::bad_request(
-            "ttl_seconds must be 0 (until disabled) or at most 604800 seconds",
+            "ttl_seconds must be between 1 and 3600 seconds; permanent drop rules are intentionally disabled",
         ));
     }
     let rule = s
         .throttle
-        .set_rule(&target, req.drop_percent, Some(ttl_seconds))
+        .set_rule(&target, req.drop_percent, ttl_seconds)
         .map_err(ApiError::from)?;
     tracing::warn!(
         target=%target,
@@ -407,7 +407,7 @@ async fn clear_topology_throttle(
 ) -> ApiResult<Json<serde_json::Value>> {
     if !s.throttle.available() {
         return Err(ApiError::service_unavailable(
-            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_INTERFACE to the ingress/forwarding interface",
+            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_ENABLED=true (enforcement always uses BAZALT_INTERFACE)",
         ));
     }
     let target = s

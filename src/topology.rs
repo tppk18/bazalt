@@ -18,6 +18,7 @@ const MAX_AUDIT_ENTRIES: usize = 512;
 const MAX_TOPOLOGY_GC_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SNAPSHOT_GROUPS: usize = 256;
 const MAX_SNAPSHOT_SOURCES: usize = 2_048;
+pub const MAX_THROTTLE_TTL_SECS: u64 = 60 * 60;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PendingCounters {
@@ -124,19 +125,27 @@ impl TopologyTracker {
     }
 
     pub fn local_observer(self: &Arc<Self>) -> LocalTopologyObserver {
+        self.local_observer_ignoring_source_mac(None)
+    }
+
+    pub fn local_observer_ignoring_source_mac(
+        self: &Arc<Self>,
+        ignored_source_mac: Option<[u8; 6]>,
+    ) -> LocalTopologyObserver {
         LocalTopologyObserver {
             shared: self.clone(),
             pending: AHashMap::new(),
             last_flush: Instant::now(),
+            ignored_source_mac,
         }
     }
 
     pub fn canonical_throttle_target(&self, value: &str) -> std::result::Result<String, String> {
         let target = Ipv4Target::parse(value).map_err(|error| error.to_string())?;
-        if target.prefix < self.group_prefix_v4 {
+        if target.prefix != self.group_prefix_v4 && target.prefix != 32 {
             return Err(format!(
-                "throttle prefix /{} is broader than automatic topology group /{}",
-                target.prefix, self.group_prefix_v4
+                "throttle target must be an automatic /{} group or one IPv4 source (/32), got /{}",
+                self.group_prefix_v4, target.prefix
             ));
         }
         Ok(target.canonical())
@@ -327,14 +336,25 @@ pub struct LocalTopologyObserver {
     shared: Arc<TopologyTracker>,
     pending: AHashMap<Ipv4Addr, PendingCounters>,
     last_flush: Instant,
+    ignored_source_mac: Option<[u8; 6]>,
 }
 
 impl LocalTopologyObserver {
+    /// Passive libpcap can expose locally transmitted Ethernet frames. Keep the
+    /// direction check separate from packet accounting so capture can first
+    /// perform the authoritative service-destination decision after decoding.
     #[inline]
-    pub fn observe_ethernet_frame(&mut self, ts_ns: u64, wire_len: usize, frame: &[u8]) {
-        let Some(ip) = ipv4_source_from_ethernet(frame) else {
-            return;
-        };
+    pub fn ignores_ethernet_frame(&self, frame: &[u8]) -> bool {
+        self.ignored_source_mac
+            .is_some_and(|mac| ethernet_source_mac(frame) == Some(mac))
+    }
+
+    /// Account one IPv4 packet that has already passed the service-destination
+    /// gate. Throttle enforcement is intentionally *not* consulted here: once
+    /// a source is penalized, the XDP rule applies to all traffic from that IP,
+    /// while topology visibility remains scoped to configured service ports.
+    #[inline]
+    pub fn observe_ipv4_source(&mut self, ts_ns: u64, wire_len: usize, ip: Ipv4Addr) {
         let entry = self.pending.entry(ip).or_default();
         entry.packets = entry.packets.saturating_add(1);
         entry.bytes = entry.bytes.saturating_add(wire_len as u64);
@@ -413,34 +433,9 @@ pub struct TopologySourceSnapshot {
 
 
 #[inline]
-fn ipv4_source_from_ethernet(frame: &[u8]) -> Option<Ipv4Addr> {
-    if frame.len() < 14 {
-        return None;
-    }
-    let mut ether_type = u16::from_be_bytes([frame[12], frame[13]]);
-    let mut offset = 14usize;
-    for _ in 0..2 {
-        if ether_type != 0x8100 && ether_type != 0x88a8 {
-            break;
-        }
-        if frame.len() < offset + 4 {
-            return None;
-        }
-        ether_type = u16::from_be_bytes([frame[offset + 2], frame[offset + 3]]);
-        offset += 4;
-    }
-    if ether_type != 0x0800 || frame.len() < offset + 20 {
-        return None;
-    }
-    if frame[offset] >> 4 != 4 || frame[offset] & 0x0f < 5 {
-        return None;
-    }
-    Some(Ipv4Addr::new(
-        frame[offset + 12],
-        frame[offset + 13],
-        frame[offset + 14],
-        frame[offset + 15],
-    ))
+fn ethernet_source_mac(frame: &[u8]) -> Option<[u8; 6]> {
+    let bytes = frame.get(6..12)?;
+    Some(bytes.try_into().ok()?)
 }
 
 fn network_for(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
@@ -524,6 +519,7 @@ pub struct ThrottleAuditEntry {
 pub struct ThrottleSnapshot {
     pub available: bool,
     pub interface: Option<String>,
+    pub attach_mode: Option<String>,
     pub rules: Vec<ThrottleRuleSnapshot>,
     pub audit: Vec<ThrottleAuditEntry>,
 }
@@ -533,8 +529,8 @@ struct ActiveRule {
     target: Ipv4Target,
     drop_percent: u8,
     created_at: DateTime<Utc>,
-    expires_at: Option<DateTime<Utc>>,
-    expires_instant: Option<Instant>,
+    expires_at: DateTime<Utc>,
+    expires_instant: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -556,18 +552,15 @@ struct ThrottleInner {
 }
 
 impl ThrottleManager {
-    pub fn new(interface: Option<&str>) -> Result<Self> {
-        let interface = interface
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let backend = match interface.as_deref() {
-            Some(interface) => Some(XdpThrottleBackend::open(interface)?),
-            None => None,
-        };
+    pub fn new(enabled: bool, interface: &str) -> Result<Self> {
+        let interface = interface.trim();
+        if enabled && interface.is_empty() {
+            anyhow::bail!("BAZALT_INTERFACE cannot be empty when throttle is enabled");
+        }
+        let backend = enabled.then(|| XdpThrottleBackend::open(interface)).transpose()?;
         Ok(Self {
             inner: Arc::new(ThrottleInner {
-                interface,
+                interface: enabled.then(|| interface.to_owned()),
                 backend,
                 book: Mutex::new(RuleBook::default()),
                 operations: Mutex::new(()),
@@ -579,32 +572,44 @@ impl ThrottleManager {
         self.inner.backend.is_some()
     }
 
+    pub fn attach_mode(&self) -> Option<&'static str> {
+        self.inner.backend.as_ref().map(XdpThrottleBackend::attach_mode)
+    }
+
     pub fn set_rule(
         &self,
         target: &str,
         drop_percent: u8,
-        ttl_seconds: Option<u64>,
+        ttl_seconds: u64,
     ) -> Result<ThrottleRuleSnapshot> {
         if !(1..=100).contains(&drop_percent) {
             anyhow::bail!("drop_percent must be between 1 and 100");
+        }
+        if !(1..=MAX_THROTTLE_TTL_SECS).contains(&ttl_seconds) {
+            anyhow::bail!(
+                "throttle TTL must be between 1 and {MAX_THROTTLE_TTL_SECS} seconds"
+            );
         }
         let backend = self
             .inner
             .backend
             .as_ref()
             .context("traffic enforcement is not configured")?;
+        let target = Ipv4Target::parse(target)?;
+        let now = Utc::now();
+        let expires_at = now
+            .checked_add_signed(chrono::Duration::seconds(ttl_seconds as i64))
+            .context("throttle TTL overflow")?;
+        let expires_instant = Instant::now()
+            .checked_add(Duration::from_secs(ttl_seconds))
+            .context("throttle TTL overflow")?;
+
+        // Kernel and in-memory rulebook are serialized as one control-plane
+        // operation. Compute all fallible metadata first so we never install a
+        // kernel rule that cannot be represented in the rulebook.
         let _operation = self.inner.operations.lock();
         self.prune_expired_locked();
-        let target = Ipv4Target::parse(target)?;
-        let ttl_seconds = ttl_seconds.filter(|seconds| *seconds > 0);
         backend.set_rule(target, drop_percent, ttl_seconds)?;
-
-        let now = Utc::now();
-        let expires_at = ttl_seconds
-            .and_then(|seconds| i64::try_from(seconds).ok())
-            .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)));
-        let expires_instant = ttl_seconds
-            .and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)));
         let rule = ActiveRule {
             target,
             drop_percent,
@@ -621,7 +626,7 @@ impl ThrottleManager {
                 action: "set".to_owned(),
                 target: target.canonical(),
                 drop_percent,
-                ttl_seconds,
+                ttl_seconds: Some(ttl_seconds),
             },
         );
         drop(book);
@@ -670,6 +675,7 @@ impl ThrottleManager {
         ThrottleSnapshot {
             available: self.available(),
             interface: self.inner.interface.clone(),
+            attach_mode: self.attach_mode().map(str::to_owned),
             rules,
             audit,
         }
@@ -681,11 +687,7 @@ impl ThrottleManager {
             let book = self.inner.book.lock();
             book.rules
                 .iter()
-                .filter_map(|(target, rule)| {
-                    rule.expires_instant
-                        .filter(|deadline| *deadline <= now)
-                        .map(|_| *target)
-                })
+                .filter_map(|(target, rule)| (rule.expires_instant <= now).then_some(*target))
                 .collect::<Vec<_>>()
         };
         if expired.is_empty() {
@@ -738,7 +740,7 @@ impl ThrottleManager {
             target: rule.target.canonical(),
             drop_percent: rule.drop_percent,
             created_at: rule.created_at.clone(),
-            expires_at: rule.expires_at.clone(),
+            expires_at: Some(rule.expires_at.clone()),
             seen_packets: stats.seen_packets,
             seen_bytes: stats.seen_bytes,
             dropped_packets: stats.dropped_packets,
@@ -785,6 +787,7 @@ extern "C" {
         object_data: *const u8,
         object_len: usize,
     ) -> *mut PmThrottleHandle;
+    fn pm_throttle_attach_mode(handle: *mut PmThrottleHandle) -> std::os::raw::c_int;
     fn pm_throttle_set_rule(
         handle: *mut PmThrottleHandle,
         addr: *const u8,
@@ -821,11 +824,20 @@ impl XdpThrottleBackend {
         Ok(Self { handle })
     }
 
+    fn attach_mode(&self) -> &'static str {
+        match unsafe { pm_throttle_attach_mode(self.handle.as_ptr()) } {
+            1 => "native-link",
+            2 => "native-netlink",
+            3 => "generic-skb-netlink",
+            _ => "unknown",
+        }
+    }
+
     fn set_rule(
         &self,
         target: Ipv4Target,
         drop_percent: u8,
-        ttl_seconds: Option<u64>,
+        ttl_seconds: u64,
     ) -> Result<()> {
         let octets = target.network.octets();
         let rc = unsafe {
@@ -834,7 +846,7 @@ impl XdpThrottleBackend {
                 octets.as_ptr(),
                 target.prefix as u32,
                 drop_percent as u32,
-                ttl_seconds.unwrap_or(0),
+                ttl_seconds,
             )
         };
         if rc < 0 {
@@ -902,11 +914,15 @@ impl XdpThrottleBackend {
         anyhow::bail!("XDP traffic enforcement requires a Linux build with the afxdp feature")
     }
 
+    fn attach_mode(&self) -> &'static str {
+        "unavailable"
+    }
+
     fn set_rule(
         &self,
         _target: Ipv4Target,
         _drop_percent: u8,
-        _ttl_seconds: Option<u64>,
+        _ttl_seconds: u64,
     ) -> Result<()> {
         anyhow::bail!("XDP traffic enforcement is unavailable")
     }
@@ -941,24 +957,40 @@ mod tests {
     }
 
     #[test]
+    fn passive_topology_can_ignore_local_egress_mac() {
+        let tracker = TopologyTracker::new(24, Duration::from_secs(60), 1024);
+        let local_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut outgoing = ethernet_ipv4(
+            Ipv4Addr::new(10, 10, 99, 5),
+            Ipv4Addr::new(10, 10, 1, 5),
+            None,
+        );
+        outgoing[6..12].copy_from_slice(&local_mac);
+        let mut incoming = ethernet_ipv4(
+            Ipv4Addr::new(10, 10, 1, 5),
+            Ipv4Addr::new(10, 10, 99, 5),
+            None,
+        );
+        incoming[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 2]);
+
+        let mut observer = tracker.local_observer_ignoring_source_mac(Some(local_mac));
+        assert!(observer.ignores_ethernet_frame(&outgoing));
+        assert!(!observer.ignores_ethernet_frame(&incoming));
+        observer.observe_ipv4_source(2, incoming.len(), Ipv4Addr::new(10, 10, 1, 5));
+        observer.flush();
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.source_count, 1);
+        assert_eq!(snapshot.groups[0].sources[0].ip, "10.10.1.5");
+    }
+
+    #[test]
     fn automatically_groups_ipv4_sources_by_prefix() {
         let tracker = TopologyTracker::new(24, Duration::from_secs(60), 1024);
         let mut observer = tracker.local_observer();
-        observer.observe_ethernet_frame(
-            123,
-            100,
-            &ethernet_ipv4(Ipv4Addr::new(10, 10, 1, 4), Ipv4Addr::new(10, 20, 1, 10), None),
-        );
-        observer.observe_ethernet_frame(
-            124,
-            200,
-            &ethernet_ipv4(Ipv4Addr::new(10, 10, 1, 99), Ipv4Addr::new(10, 20, 1, 10), None),
-        );
-        observer.observe_ethernet_frame(
-            125,
-            300,
-            &ethernet_ipv4(Ipv4Addr::new(10, 10, 2, 7), Ipv4Addr::new(10, 20, 1, 10), None),
-        );
+        observer.observe_ipv4_source(123, 100, Ipv4Addr::new(10, 10, 1, 4));
+        observer.observe_ipv4_source(124, 200, Ipv4Addr::new(10, 10, 1, 99));
+        observer.observe_ipv4_source(125, 300, Ipv4Addr::new(10, 10, 2, 7));
         observer.flush();
 
         let snapshot = tracker.snapshot();
@@ -976,30 +1008,12 @@ mod tests {
     }
 
     #[test]
-    fn source_parser_counts_vlan_ipv4_wire_frames() {
-        let frame = ethernet_ipv4(
-            Ipv4Addr::new(200, 1, 1, 9),
-            Ipv4Addr::new(10, 0, 0, 1),
-            Some(123),
-        );
-        assert_eq!(ipv4_source_from_ethernet(&frame), Some(Ipv4Addr::new(200, 1, 1, 9)));
-    }
-
-    #[test]
     fn source_table_is_bounded_and_overflow_is_counted() {
         let tracker = TopologyTracker::new(24, Duration::from_secs(60), 1);
         let mut observer = tracker.local_observer();
-        observer.observe_ethernet_frame(
-            1,
-            100,
-            &ethernet_ipv4(Ipv4Addr::new(10, 10, 1, 1), Ipv4Addr::new(10, 20, 1, 10), None),
-        );
+        observer.observe_ipv4_source(1, 100, Ipv4Addr::new(10, 10, 1, 1));
         observer.flush();
-        observer.observe_ethernet_frame(
-            2,
-            200,
-            &ethernet_ipv4(Ipv4Addr::new(10, 10, 2, 1), Ipv4Addr::new(10, 20, 1, 10), None),
-        );
+        observer.observe_ipv4_source(2, 200, Ipv4Addr::new(10, 10, 2, 1));
         observer.flush();
 
         let snapshot = tracker.snapshot();
@@ -1019,14 +1033,10 @@ mod tests {
         for i in 0..300u32 {
             let third = ((i / 254) % 256) as u8;
             let fourth = (i % 254 + 1) as u8;
-            observer.observe_ethernet_frame(
+            observer.observe_ipv4_source(
                 i as u64 + 1,
                 100,
-                &ethernet_ipv4(
-                    Ipv4Addr::new(10, 42, third, fourth),
-                    Ipv4Addr::new(10, 20, 1, 10),
-                    None,
-                ),
+                Ipv4Addr::new(10, 42, third, fourth),
             );
         }
         observer.flush();
@@ -1048,14 +1058,10 @@ mod tests {
             let second = ((i / (254 * 254)) % 254 + 1) as u8;
             let third = ((i / 254) % 254 + 1) as u8;
             let fourth = (i % 254 + 1) as u8;
-            observer.observe_ethernet_frame(
+            observer.observe_ipv4_source(
                 i as u64 + 1,
                 64,
-                &ethernet_ipv4(
-                    Ipv4Addr::new(10, second, third, fourth),
-                    Ipv4Addr::new(10, 20, 1, 10),
-                    None,
-                ),
+                Ipv4Addr::new(10, second, third, fourth),
             );
         }
         observer.flush();
@@ -1084,6 +1090,7 @@ mod tests {
             "10.10.10.10"
         );
         assert!(tracker.canonical_throttle_target("10.10.0.0/16").is_err());
+        assert!(tracker.canonical_throttle_target("10.10.1.128/25").is_err());
         assert!(tracker.canonical_throttle_target("10.10.1.1/33").is_err());
         assert!(tracker.canonical_throttle_target("not-an-ip").is_err());
     }

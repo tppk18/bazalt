@@ -6,11 +6,13 @@ cd "$ROOT"
 cleanup() { rm -rf scripts/__pycache__; }
 trap cleanup EXIT
 
-python3 -m py_compile scripts/generate_fixture.py scripts/verify_fixture.py scripts/static_verify.py
+python3 -m py_compile scripts/generate_fixture.py scripts/verify_fixture.py scripts/static_verify.py scripts/verify_p0_fixes.py scripts/review_p0_integration.py
 python3 scripts/generate_fixture.py
 python3 scripts/verify_fixture.py
 python3 scripts/static_verify.py
 python3 scripts/verify_v04_hotpath.py
+python3 scripts/verify_p0_fixes.py
+python3 scripts/review_p0_integration.py
 node --check frontend/app.js
 bash -n scripts/smoke.sh
 python3 - <<'PY'

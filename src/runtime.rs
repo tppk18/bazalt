@@ -53,11 +53,21 @@ pub async fn run(cfg: Config) -> Result<()> {
         cfg.topology_source_ttl,
         cfg.topology_max_sources,
     );
-    let throttle = ThrottleManager::new(cfg.throttle_interface.as_deref())?;
-    if let Some(interface) = cfg.throttle_interface.as_deref() {
-        tracing::info!(%interface, "IPv4 XDP traffic enforcement enabled");
+    let throttle = ThrottleManager::new(cfg.throttle_enabled, &cfg.interface)?;
+    if cfg.throttle_enabled {
+        tracing::info!(
+            interface = %cfg.interface,
+            attach_mode = throttle.attach_mode().unwrap_or("unknown"),
+            "IPv4 XDP traffic enforcement enabled on capture ingress"
+        );
+        if cfg.capture_mode == crate::config::CaptureMode::AfXdp {
+            tracing::info!(
+                interface = %cfg.interface,
+                "AF_XDP was requested while throttle is enabled; effective capture will be passive libpcap"
+            );
+        }
     } else {
-        tracing::info!("IPv4 traffic topology enabled; XDP enforcement disabled until BAZALT_THROTTLE_INTERFACE is set");
+        tracing::info!("IPv4 traffic topology enabled; XDP enforcement disabled (BAZALT_THROTTLE_ENABLED=false)");
     }
 
     let (live_events, _) = broadcast::channel(2048);
@@ -92,7 +102,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     )?;
     tracing::info!(workers = l7.worker_count(), "L7 runtime started");
 
-    let flow = FlowRuntime::spawn(cfg.clone(), metrics.clone(), l7.input.clone())?;
+    let flow = FlowRuntime::spawn(
+        cfg.clone(),
+        metrics.clone(),
+        l7.input.clone(),
+        services.clone(),
+    )?;
     tracing::info!(workers = flow.handle_count(), "flow runtime started");
 
     let (replay, replay_task) = replay::start(
@@ -138,11 +153,17 @@ pub async fn run(cfg: Config) -> Result<()> {
         topology.clone(),
         shutdown.clone(),
     )?;
-    tracing::info!(workers=capture.worker_count(), mode=?cfg.capture_mode, "capture runtime started");
+    tracing::info!(
+        workers = capture.worker_count(),
+        requested_mode = ?capture.requested_mode(),
+        effective_mode = ?capture.effective_mode(),
+        mode_adjusted = capture.mode_adjusted(),
+        "capture runtime started"
+    );
     healthy.store(true, Ordering::Release);
 
     let supervise_capture = matches!(
-        cfg.capture_mode,
+        capture.effective_mode(),
         crate::config::CaptureMode::AfXdp | crate::config::CaptureMode::PcapLive
     );
     let mut supervisor_tick = tokio::time::interval(std::time::Duration::from_millis(250));

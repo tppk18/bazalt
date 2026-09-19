@@ -1,3 +1,71 @@
+# BAZALT 0.4.1.6 — P0 correctness and crash-safety hotfix
+
+Cargo reports `0.4.1+hotfix.6`; the external/API release label is `0.4.1.6`.
+
+## Fixed in 0.4.1.6
+
+- **Live matcher overload no longer silently loses accepted content.** Content first attempts non-blocking matcher admission; a full matcher shard then applies backpressure through the existing bounded pipeline instead of discarding work. `matcher_queue_backpressure_total` exposes this condition; `matcher_queue_drops_total` is reserved for a disconnected matcher. Best-effort `FlowClosed` tail cleanup remains non-blocking and has its own `matcher_housekeeping_drops_total` metric.
+- **Remote source-port collision no longer bypasses service scoping.** Before full decode, remote ingress is admitted only when its destination port is configured. Local egress is admitted by source service port so response reconstruction remains intact. New-flow admission remains destination-only.
+- **Dynamic live BPF updates are fail-safe.** The live filter uses directional service semantics and avoids `protochain` in the kernel program. If the optimized filter cannot be installed, BAZALT installs a broad fail-open filter and keeps the exact userspace gate authoritative. If even fail-open installation fails, the supervised capture worker stops instead of running with a stale restrictive filter.
+- **Segment rotation is now a crash-consistent commit boundary.** Before opening the next segment BAZALT fsyncs payload bytes, publishes every pending `content_index` row without draining unsent suffixes, waits for the local metadata spool durable barrier, and only then rotates.
+- **Historical orphaned payload indexes are healed once on upgrade.** A durable recovery marker triggers one full retained-segment index rebuild on the first 0.4.1.6 startup; later startups only recover the segment that was active at the previous crash.
+- **Netlink XDP fallback can recover its own stale attachment after an abnormal exit.** Recovery checks the attached XDP program name and exact BPF tag before detach, keeps `UPDATE_IF_NOEXIST`, and uses a per-interface ownership lock. Foreign XDP programs are not replaced.
+
+## Verification gates
+
+`./scripts/verify_source.sh` now includes two distinct P0 source gates: `verify_p0_fixes.py` for local implementation contracts and `review_p0_integration.py` for cross-file pipeline/failure-ordering contracts, in addition to fixture, repository invariant, hot-path, JS, shell, YAML, Rust fmt/clippy/test and release-build gates.
+
+---
+
+# BAZALT 0.4.1.5 — service-scoped topology and radial map
+
+This hotfix aligns Traffic Topology with the A/D service model. Cargo reports `0.4.1+hotfix.5`; the external/API release label is `0.4.1.5`.
+
+## Fixed in 0.4.1.5
+
+- Topology and participant traffic statistics now count only remote IPv4 packets whose actual destination port is one of the configured services. Off-service traffic is intentionally absent from team/source statistics.
+- Throttle semantics remain source-wide. After a `/32` or automatic group rule is installed, XDP still matches only source IPv4/prefix and applies the selected drop percentage across every destination port.
+- Added a lightweight pre-decode IPv4 service classifier so ordinary unrelated TCP/UDP is rejected before the full packet decoder. Fragments and supported tunnels stay conservative and are decided after bounded reassembly/decapsulation.
+- New flow allocation is directional: a packet can create flow/L7 state only when it is actually addressed to a configured service destination port. A hostile sender using a configured value as its source port can no longer create a false service flow. Existing admitted flows continue to process reverse traffic normally.
+- `packets_received`/`packet_bytes` are now incremented only after flow admission, so source-port collisions/off-service new flows cannot leak into accepted-service metrics.
+- Post-decode service classification uses one immutable `ArcSwap` snapshot for both topology visibility and bidirectional service-flow membership; the rare new-flow path performs its own directional admission check.
+- With an empty service registry, capture rejects frames before the full decoder even on AF_XDP backends.
+- `BAZALT_EARLY_PORT_FILTER=true` is compatible again and is now the default; backend BPF is an optimization while the userspace service gate remains authoritative.
+- `GET /api/topology` now returns the current `service_ports` list so the UI can make the analysis scope explicit.
+- Replaced the topology-only list presentation with a radial/star map centered on BAZALT/service ports. Automatic source groups form the rays, while the detailed per-source table remains available below for precise throttle actions.
+- Updated release/static verification to prevent regressions back to pre-service topology accounting.
+
+## Semantics
+
+If `192.168.0.2` sends to a configured port, it becomes visible in topology/statistics. If the operator then applies a throttle to `192.168.0.2`, the kernel rule penalizes all IPv4 traffic from `192.168.0.2`, including traffic to ports that are not configured services.
+
+---
+
+# BAZALT 0.4.1.4 — throttle configuration and XDP ownership correction
+
+This hotfix corrects the remaining design mistakes in the first Traffic Topology/XDP enforcement implementation. Cargo reports `0.4.1+hotfix.4`; the external/API release label is `0.4.1.4`.
+
+## Fixed in 0.4.1.4
+
+- Removed `BAZALT_THROTTLE_INTERFACE` from the user-facing configuration. Enforcement is always attached to `BAZALT_INTERFACE`; a different interface no longer exists as a supported topology.
+- Added the explicit safety switch `BAZALT_THROTTLE_ENABLED` (default `false`). Enabling it means the operator intentionally arms real packet drops on the capture ingress.
+- When throttle is enabled and AF_XDP was requested, effective capture is passive libpcap. RX queue discovery/CPU planning now use the effective mode, so unused AF_XDP queues are not probed or reserved.
+- Reworked XDP ownership: BAZALT first attempts a native BPF link for fail-safe process lifecycle; if BPF-link attach is unavailable it falls back through libbpf netlink attach, which may select native or generic/SKB mode. The fallback uses `XDP_FLAGS_UPDATE_IF_NOEXIST` and never replaces a foreign XDP program.
+- The loader exposes whether enforcement is `native-link`, `native-netlink`, or `generic-skb-netlink`. Netlink cleanup checks the exact BPF program id before detach so Bazalt does not remove a program that another component replaced.
+- Throttle targets are now restricted to exactly one automatic group prefix (for example `/24`) or one host (`/32`); hidden intermediate CIDRs such as `/25` are rejected.
+- Permanent drop rules were removed. Every rule has a finite `1..3600s` TTL; the kernel checks expiry itself, so even a generic/netlink enforcement rule stops dropping after its deadline if userspace crashes.
+- Active throttle rules are rendered independently of the live source list, so a `100%` drop cannot make its own Disable control disappear after the source TTL.
+- Passive libpcap topology ignores frames sourced from the capture interface MAC, preventing the host's own outgoing traffic from being misclassified as a participant sender while keeping bidirectional packets available to flow/L7 analysis.
+- Complete topology accounting now rejects `BAZALT_EARLY_PORT_FILTER=true`; otherwise off-service/spam IPv4 could be hidden in kernel before Topology observes it.
+- Active rule UI derives live matched/drop rates from consecutive kernel counters, so operators can still see pre-drop pressure after a throttle is applied instead of only the survivor rate from libpcap.
+- API/UI/docs/static verification were updated to the same-interface-only model.
+
+## Operational note
+
+`BAZALT_THROTTLE_ENABLED=true` is destructive by design: matching ingress packets can be returned as `XDP_DROP`. Rules always expire within one hour. When enabled, live topology rates from libpcap represent traffic that survived XDP; per-rule kernel counters are authoritative for matched/dropped traffic. On a netlink fallback, a hard process kill may leave a pass-only XDP program attached after all rule TTLs expire; this no longer causes indefinite packet loss, but a native-link-capable NIC has the cleaner crash lifecycle.
+
+---
+
 # BAZALT 0.4.1.2 — second stabilization tranche
 
 This hotfix implements a coherent second half-step of the pre-feature P0/P1 work while deliberately leaving the ordering/disk-retention redesign for the next tranche. Cargo reports `0.4.1+hotfix.2`; the external/API release label comes from `VERSION` and is `0.4.1.2`.
@@ -214,4 +282,4 @@ The startup log prints the selected adaptive plan.
 - Added protected `/api/topology` and XDP throttle control endpoints.
 - Added an optional XDP LPM-trie enforcement plane with `/24`/`/32` longest-prefix rules, probabilistic percentage drops, TTL, kernel-side seen/drop statistics and bounded in-memory audit history.
 - Added a `TOPOLOGY` operator view with group/member traffic share and throttle controls.
-- AF_XDP capture and throttle interfaces are intentionally forced apart to prevent accidental replacement of the capture XDP/XSK program.
+- Historical note: the first unreleased topology prototype incorrectly forced AF_XDP capture and throttle onto separate interfaces; 0.4.1.4 replaces that model with same-interface enforcement plus passive capture when armed.

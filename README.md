@@ -163,7 +163,7 @@ ClickHouse не входит в synchronous acceptance path: metadata снача
 
 ## Диагностика входящего capture
 
-`0.4.1.2` разделяет метрики source-level и accepted packet-level. По умолчанию `BAZALT_EARLY_PORT_FILTER=false`: libpcap не получает ранний BPF по портам, а обязательный userspace allow-list по настроенным сервисам остаётся активным. Это исключает ситуацию, когда несовместимость BPF/link-layer выглядит как полностью мёртвый capture.
+Source-level capture-health metrics and accepted service-packet metrics are separate. `BAZALT_EARLY_PORT_FILTER=true` is now the default for backends that support dynamic BPF: unrelated traffic is rejected early, while the userspace service allow-list remains authoritative after bounded reassembly/decapsulation.
 
 Ключевые метрики:
 
@@ -171,13 +171,13 @@ ClickHouse не входит в synchronous acceptance path: metadata снача
 bazalt_capture_frames_total      # кадры, которые реально вернул capture backend
 bazalt_capture_backend_drops_total # потери до userspace (pcap/AF_XDP backend)
 bazalt_capture_backend_invalid_descs_total # invalid AF_XDP RX descriptors
-bazalt_packets_received_total    # TCP/UDP пакеты на настроенных service ports
-bazalt_packets_filtered_total    # разобранные пакеты с ненастроенных портов
+bazalt_packets_received_total    # TCP/UDP пакеты, реально допущенные в service flows (оба направления)
+bazalt_packets_filtered_total    # пакеты, отсечённые service allow-list (включая ранний gate)
 bazalt_packets_ignored_total     # unsupported EtherType/L4/tunnel frames
 bazalt_packet_parse_errors_total # ошибки Ethernet/IP/TCP/UDP parsing
 ```
 
-Если ранняя фильтрация libpcap всё же нужна, включите `BAZALT_EARLY_PORT_FILTER=true`.
+Traffic Topology теперь намеренно service-scoped: off-service IPv4 не попадает в participant statistics. `BAZALT_EARLY_PORT_FILTER=true` рекомендуется и включён по умолчанию; userspace повторяет проверку после reassembly/decapsulation, чтобы ранняя оптимизация не меняла семантику.
 
 ## CPU и post-capture pipeline
 
@@ -253,6 +253,8 @@ bazalt_active_flows
 bazalt_flow_queue_high_watermark
 bazalt_l7_queue_high_watermark
 bazalt_match_queue_high_watermark
+bazalt_matcher_queue_backpressure_total
+bazalt_matcher_housekeeping_drops_total
 bazalt_storage_queue_high_watermark
 bazalt_matcher_bytes_total
 bazalt_replay_bytes_total
@@ -270,8 +272,14 @@ bazalt_replay_bytes_total
 
 BAZALT now has a live IPv4 `TOPOLOGY` view. Team-like groups are inferred automatically from source addresses (default `/24`), so `10.10.1.x` and `10.10.2.x` naturally become separate groups without a roster/config file. Each group expands to the individual sources with PPS, bit rate, cumulative traffic and relative share.
 
-Topology counts wire IPv4 frames before the service allow-list, which keeps packet-spam visible even when it targets an unconfigured port. Capture workers aggregate locally and merge every ~250 ms instead of locking shared state per packet.
+Topology/statistics are service-scoped: a source is counted only when a remote IPv4 packet is actually addressed to one of the configured service destination ports. Ordinary off-service IPv4 is rejected before the full decoder where possible, and the authoritative service decision is repeated after bounded fragment/tunnel decoding. Capture workers aggregate accepted source counters locally and merge every ~250 ms instead of locking shared state per packet.
 
-Optional enforcement uses real XDP packet drops. Configure `BAZALT_THROTTLE_INTERFACE` to the ingress/forwarding interface, then the UI can apply a percentage drop to one source (`/32`) or the whole auto-discovered group (`/24`) with a TTL. In AF_XDP mode this interface must be different from `BAZALT_INTERFACE` to keep passive capture and enforcement failure domains separate.
+Optional enforcement uses real XDP packet drops on `BAZALT_INTERFACE`; there is no separate enforcement-interface setting. Enable it with `BAZALT_THROTTLE_ENABLED=true`. The UI can apply a percentage drop to one source (`/32`) or the whole auto-discovered group (`/24`) with a mandatory 1–3600 second TTL. When enforcement is enabled while `BAZALT_CAPTURE_MODE=afxdp` was requested, BAZALT deliberately keeps the throttle XDP program as the ingress owner and switches capture to passive libpcap for packets that receive `XDP_PASS`. The XDP loader prefers a native BPF-link attachment (automatic detach on process exit). If that path is unavailable it falls back to legacy netlink attach; netlink may still attach native XDP, or generic/SKB on NICs such as Wi-Fi. The fallback never replaces an existing XDP owner.
 
-Topology source state is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`); traffic above the cardinality cap is still included in aggregate observed counters and is exposed as untracked overflow.
+When passive libpcap is the capture backend, Topology excludes Ethernet frames sourced from the local interface MAC so the host's own outgoing traffic is not counted as a participant sender. Reverse packets of an already admitted service flow still reach flow/L7 analysis, but they are not added to ingress-source statistics.
+
+Topology source state is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`); service-directed traffic above the cardinality cap is still included in aggregate counters and is exposed as untracked overflow. The topology screen uses a radial/star map: BAZALT/service ports are the center and automatically discovered source subnets form the rays.
+
+### 0.4.1.6 P0 hardening
+
+The 0.4.1.6 hotfix closes the remaining confirmed P0 correctness gaps found during live testing: full matcher queues now backpressure durable content rather than silently lose accepted match work while `FlowClosed` housekeeping stays non-blocking; remote traffic cannot enter the expensive path solely by spoofing a configured **source** port; dynamic libpcap BPF updates fail open instead of leaving a stale filter that can hide a newly-added service; segment rotation is ordered behind a durable metadata-spool barrier; and the first upgraded startup heals historical segment/index orphan windows. Netlink XDP fallback also recognizes and removes only an exact stale BAZALT throttle program, never an unrelated XDP owner.

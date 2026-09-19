@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     metrics::Metrics,
     model::{
-        ContentRecord, ContentView, Direction, LiveEvent, MatchInput, MatchRecord, MetadataEvent,
+        ContentRecord, ContentView, Direction, LiveEvent, MatchRecord, MetadataEvent,
         NewPattern, PatternAction, PatternDirection, PatternKind, PatternRevision,
     },
     storage::postgres::PostgresStore,
@@ -692,37 +692,31 @@ impl MatcherIngress {
         self.interest_mask.load(Ordering::Acquire) & content_view_bit(view) != 0
     }
 
-    fn prepare_work(&self, input: MatchInput) -> Option<(Uuid, MatcherWork)> {
-        match input {
-            MatchInput::Content(record) => {
-                if self.interest_mask.load(Ordering::Acquire) & content_view_bit(record.view) == 0 {
-                    return None;
-                }
-                let snapshot = self.active.load_full();
-                if !snapshot.is_interested(&record) {
-                    return None;
-                }
-                let generation = self.metrics.pattern_generation.load(Ordering::Acquire);
-                let flow_id = record.flow_id;
-                Some((
-                    flow_id,
-                    MatcherWork::Content {
-                        record,
-                        snapshot,
-                        generation,
-                    },
-                ))
-            }
-            MatchInput::FlowClosed(flow_id) => Some((flow_id, MatcherWork::FlowClosed(flow_id))),
+    fn prepare_content(&self, record: ContentRecord) -> Option<(Uuid, MatcherWork)> {
+        if self.interest_mask.load(Ordering::Acquire) & content_view_bit(record.view) == 0 {
+            return None;
         }
+        let snapshot = self.active.load_full();
+        if !snapshot.is_interested(&record) {
+            return None;
+        }
+        let generation = self.metrics.pattern_generation.load(Ordering::Acquire);
+        let flow_id = record.flow_id;
+        Some((
+            flow_id,
+            MatcherWork::Content {
+                record,
+                snapshot,
+                generation,
+            },
+        ))
     }
 
-    /// Best-effort admission to the live matcher.  Matcher analysis is
-    /// recoverable from immutable segments, so a full analytical queue must
-    /// never stall L7, flow reassembly, or capture.  The drop is explicit in
-    /// metrics and a subsequent historical replay covers the omitted live work.
-    pub fn try_send(&self, input: MatchInput) -> bool {
-        let Some((flow_id, work)) = self.prepare_work(input) else {
+    /// Lossless admission for content that has already entered the durable
+    /// content pipeline. The common path is non-blocking; queue saturation
+    /// applies backpressure rather than silently discarding a possible flag.
+    pub fn send_content(&self, record: ContentRecord) -> bool {
+        let Some((flow_id, work)) = self.prepare_content(record) else {
             return true;
         };
         let idx = (flow_id.as_u128() as usize) % self.shard_txs.len();
@@ -734,17 +728,56 @@ impl MatcherIngress {
                 );
                 true
             }
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(work)) => {
                 self.metrics
-                    .matcher_queue_drops
+                    .matcher_queue_backpressure
                     .fetch_add(1, Ordering::Relaxed);
-                false
+                match self.shard_txs[idx].send(work) {
+                    Ok(()) => {
+                        Metrics::queue_enqueued(
+                            &self.metrics.match_queue_depth,
+                            &self.metrics.match_queue_high_watermark,
+                        );
+                        true
+                    }
+                    Err(_) => {
+                        self.metrics
+                            .matcher_queue_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            shard = idx,
+                            "live matcher stopped while applying lossless content backpressure"
+                        );
+                        false
+                    }
+                }
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.metrics
                     .matcher_queue_drops
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("live matcher stopped; dropping recoverable live work");
+                tracing::error!("live matcher stopped; accepted content could not be matched");
+                false
+            }
+        }
+    }
+
+    /// Best-effort flow-tail housekeeping. A full matcher queue must not stall
+    /// L7 just to evict a tail cache entry; those entries also expire by age.
+    pub fn try_flow_closed(&self, flow_id: Uuid) -> bool {
+        let idx = (flow_id.as_u128() as usize) % self.shard_txs.len();
+        match self.shard_txs[idx].try_send(MatcherWork::FlowClosed(flow_id)) {
+            Ok(()) => {
+                Metrics::queue_enqueued(
+                    &self.metrics.match_queue_depth,
+                    &self.metrics.match_queue_high_watermark,
+                );
+                true
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.metrics
+                    .matcher_housekeeping_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -1250,5 +1283,57 @@ mod tests {
         let scan = set.scan_bounded(&record, &[], false, 32, 4);
         assert_eq!(scan.hits.len(), 4);
         assert!(scan.limited);
+    }
+
+    #[test]
+    fn full_live_content_queue_applies_backpressure_instead_of_dropping_work() {
+        let (tx, rx) = crossbeam_channel::bounded::<MatcherWork>(1);
+        tx.send(MatcherWork::FlowClosed(Uuid::new_v4())).unwrap();
+        let metrics = Metrics::shared();
+        let compiled = CompiledPatternSet::compile(&[p("A", PatternKind::Text)]).unwrap();
+        let interest_mask = compiled.interest_mask();
+        let active = Arc::new(ArcSwap::from_pointee(compiled));
+        let ingress = MatcherIngress {
+            shard_txs: Arc::new(vec![tx]),
+            interest_mask: Arc::new(AtomicU64::new(interest_mask)),
+            active,
+            metrics: metrics.clone(),
+        };
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = rx.recv().unwrap();
+            let _ = rx.recv().unwrap();
+        });
+
+        assert!(ingress.send_content(r(b"A", 0)));
+        worker.join().unwrap();
+        assert_eq!(
+            metrics.matcher_queue_backpressure.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.matcher_queue_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flow_closed_housekeeping_never_blocks_on_full_queue() {
+        let (tx, _rx) = crossbeam_channel::bounded::<MatcherWork>(1);
+        tx.send(MatcherWork::FlowClosed(Uuid::new_v4())).unwrap();
+        let metrics = Metrics::shared();
+        let active = Arc::new(ArcSwap::from_pointee(
+            CompiledPatternSet::compile(&[]).unwrap(),
+        ));
+        let ingress = MatcherIngress {
+            shard_txs: Arc::new(vec![tx]),
+            interest_mask: Arc::new(AtomicU64::new(0)),
+            active,
+            metrics: metrics.clone(),
+        };
+
+        assert!(!ingress.try_flow_closed(Uuid::new_v4()));
+        assert_eq!(
+            metrics.matcher_housekeeping_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.matcher_queue_backpressure.load(Ordering::Relaxed), 0);
     }
 }

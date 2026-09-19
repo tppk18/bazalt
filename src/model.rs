@@ -196,6 +196,24 @@ pub struct ParsedPacket {
     pub wire_len: usize,
 }
 
+impl ParsedPacket {
+    #[inline]
+    pub fn source_endpoint(&self) -> &Endpoint {
+        match self.direction {
+            Direction::AToB => &self.key.a,
+            Direction::BToA => &self.key.b,
+        }
+    }
+
+    #[inline]
+    pub fn destination_endpoint(&self) -> &Endpoint {
+        match self.direction {
+            Direction::AToB => &self.key.b,
+            Direction::BToA => &self.key.a,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentView {
@@ -457,8 +475,3 @@ pub enum MetadataEvent {
     ContentIndex(ContentIndexRecord),
 }
 
-#[derive(Debug, Clone)]
-pub enum MatchInput {
-    Content(ContentRecord),
-    FlowClosed(FlowId),
-}

@@ -13,8 +13,8 @@ def text(rel: str) -> str:
 
 cargo = tomllib.loads(text("Cargo.toml"))
 assert cargo["package"]["name"] == "bazalt"
-assert cargo["package"]["version"] == "0.4.1+hotfix.2"
-assert text("VERSION").strip() == "0.4.1.2"
+assert cargo["package"]["version"] == "0.4.1+hotfix.6"
+assert text("VERSION").strip() == "0.4.1.6"
 assert 'cargo:rustc-env=BAZALT_RELEASE_VERSION=' in text("build.rs")
 assert 'env!("BAZALT_RELEASE_VERSION")' in text("src/api/mod.rs")
 assert "afxdp" in cargo["features"]["default"]
@@ -119,7 +119,7 @@ assert "flow_update" in text("src/storage/mod.rs")
 assert "accepts_flow" in text("src/http/mod.rs") and "packets_filtered" in text("src/capture/mod.rs")
 assert "configure_port_filter" in text("src/capture/mod.rs") and "port_filter_expression" in text("src/capture/pcap_source.rs")
 assert "generation" in text("src/http/mod.rs") and "capture service-port filter updated" in text("src/capture/mod.rs")
-assert 'parse_bool_env("PACKMATE_EARLY_PORT_FILTER", false)' in text("src/config.rs")
+assert 'parse_bool_env("PACKMATE_EARLY_PORT_FILTER", true)' in text("src/config.rs")
 assert "early capture BPF disabled; userspace service allow-list active" in text("src/capture/mod.rs")
 assert "capture_frames_total" in text("src/metrics.rs")
 assert "packets_ignored_total" in text("src/metrics.rs")
@@ -199,23 +199,57 @@ assert 'parse_env("PACKMATE_TOPOLOGY_MAX_SOURCES", 65_536usize)' in config
 assert "source_capacity_saturated" in topology and "untracked_bits_per_second" in topology
 assert "MAX_SNAPSHOT_GROUPS: usize = 256" in topology and "MAX_SNAPSHOT_SOURCES: usize = 2_048" in topology
 assert "view_truncated" in topology and "returned_source_count" in topology
-assert "canonical_throttle_target" in topology and "broader than automatic topology group" in topology
+assert "canonical_throttle_target" in topology and "automatic /" in topology and "one IPv4 source (/32)" in topology
 assert "operations: Mutex<()>" in topology and "prune_expired_locked" in topology
-assert "observe_ethernet_frame" in capture
-assert capture.index("observe_ethernet_frame") < capture.index("decoder.decode(frame)"), "topology must observe wire IPv4 before the main decoder/service filter"
+assert "observe_ipv4_source" in capture and "services.packet_scope(&packet)" in capture
+assert capture.index("decoder.decode(frame)") < capture.index("services.packet_scope(&packet)") < capture.index("observe_ipv4_source"), "topology must account only after service-destination decoding"
+assert "frame_may_belong_to_service" in capture, "obvious off-service IPv4 should be rejected before full decode"
+assert "services.accepts_destination(&packet)" in text("src/flow/mod.rs"), "new flow admission must require a packet addressed to a configured service port"
+assert "pub fn packet_scope(&self, packet: &ParsedPacket) -> ServicePacketScope" in text("src/http/mod.rs")
+flow = text("src/flow/mod.rs")
+assert "metrics.packets_received.fetch_add(1, Ordering::Relaxed)" in flow
+assert "metrics.packets_received.fetch_add" not in capture, "service packet stats must be counted only after flow admission"
+throttle_bpf = text("native/throttle.bpf.c")
+assert "data[offset + 12]" in throttle_bpf and "bpf_map_lookup_elem(&throttle_rules, &key)" in throttle_bpf
+assert "dst_port" not in throttle_bpf and "src_port" not in throttle_bpf, "throttle must remain source-wide and port-independent"
 assert '.route("/api/topology", get(topology))' in api
 assert '"/api/topology/throttle"' in api and "set_topology_throttle" in api and "clear_topology_throttle" in api
-assert "BAZALT_THROTTLE_INTERFACE" in text(".env.example")
-assert "throttle_interface.as_deref() == Some(interface.as_str())" in config
+assert "pub const MAX_THROTTLE_TTL_SECS: u64 = 60 * 60" in topology and "permanent drop rules are intentionally disabled" in api
+assert "BAZALT_THROTTLE_ENABLED=false" in text(".env.example")
+assert "BAZALT_THROTTLE_INTERFACE=" not in text(".env.example")
+assert "BAZALT_THROTTLE_INTERFACE" not in text("docker-compose.yml")
+assert "PACKMATE_THROTTLE_INTERFACE" not in config
+assert "effective_capture_mode(" in capture and "planned_mode == CaptureMode::PcapLive" in capture
+assert "using passive libpcap capture instead of AF_XDP redirect" in capture
+assert "requested_mode = ?capture.requested_mode()" in text("src/runtime.rs")
+assert "effective_mode = ?capture.effective_mode()" in text("src/runtime.rs")
+assert "mode_adjusted = capture.mode_adjusted()" in text("src/runtime.rs")
+assert "BAZALT_THROTTLE_INTERFACE must differ" not in config
+assert 'parse_bool_env("PACKMATE_THROTTLE_ENABLED", false)?' in config
 assert "BPF_MAP_TYPE_LPM_TRIE" in text("native/throttle.bpf.c")
 assert "XDP_DROP" in text("native/throttle.bpf.c") and "bpf_get_prandom_u32" in text("native/throttle.bpf.c")
-assert "bpf_program__attach_xdp" in text("native/throttle.c")
+throttle_c = text("native/throttle.c")
+assert "bpf_program__attach_xdp" in throttle_c and "bpf_link__destroy" in throttle_c
+assert "bpf_xdp_attach" in throttle_c and "XDP_FLAGS_UPDATE_IF_NOEXIST" in throttle_c
+assert "bpf_xdp_query" in throttle_c and "bpf_xdp_detach" in throttle_c
+assert "PM_THROTTLE_MODE_NATIVE_LINK" in throttle_c
+assert "PM_THROTTLE_MODE_NATIVE_NETLINK" in throttle_c
+assert "PM_THROTTLE_MODE_GENERIC_NETLINK" in throttle_c
+assert '2 => "native-netlink"' in topology and '3 => "generic-skb-netlink"' in topology
+assert "ttl_seconds == 0" in throttle_c
+assert "local_observer_ignoring_source_mac" in topology and "ethernet_source_mac" in topology
+assert "interface_mac(&cfg.interface)" in capture
+assert "Service-port scoping is authoritative for analysis and topology" in config
 assert "BAZALT_THROTTLE_BPF_OBJECT" in text("build.rs")
 topology_html = text("frontend/index.html")
 topology_js = text("frontend/app.js")
 assert 'id="topology-view"' in topology_html and 'id="throttle-modal"' in topology_html
 assert "effectiveTopologyRule" in topology_js and "data-throttle-target" in topology_js
 assert 'id="topology-view-note"' in topology_html and "view_truncated" in topology_js
+assert 'id="topology-rules-body"' in topology_html and "renderTopologyRules" in topology_js and "data-clear-throttle" in topology_js
+assert "topologyRuleRates" in topology_js and "matched_bits_per_second" in topology_js
+assert 'id="topology-star"' in topology_html and "renderTopologyStar" in topology_js
+assert '"service_ports": s.services.ports()' in api
 
 # ClickHouse 25.8 alias regression.
 ch = text("src/storage/clickhouse.rs")
@@ -283,7 +317,7 @@ assert "interest_mask" in matching and "content_view_bit" in matching
 assert "is_interested_view" in matching and re.search(
     r"matcher_tx\s*\.is_interested_view\(record\.view\)", http
 )
-assert "matcher_tx.try_send(MatchInput::Content(record))" in http
+assert "matcher_tx.send_content(record)" in http
 assert '"content segment writer stopped"' in http
 assert "semantic_tail_is_not_reused_across_stream_offset_gap" in matching
 assert "BytesMut" in http and "httparse::Request" in http and "HashMap::<String,String>" not in http
@@ -301,4 +335,4 @@ assert "timers.len() > 4096" in text("src/flow/mod.rs")
 assert "queue_enqueued" in text("src/metrics.rs") and "queue_dequeued" in text("src/metrics.rs")
 assert "DefaultHasher" not in text("src/replay/mod.rs")
 
-print("STATIC PASS: BAZALT 0.4.1.2 fidelity, durable metadata isolation, supervision, bounded decode/config and prior invariants verified")
+print("STATIC PASS: BAZALT 0.4.1.6 fidelity, durable metadata isolation, supervision, bounded decode/config and prior invariants verified")

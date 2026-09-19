@@ -4,6 +4,9 @@ pub mod segment;
 mod spool;
 
 use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -25,6 +28,25 @@ use crate::{
 };
 
 use spool::MetadataSpool;
+
+const CONTENT_INDEX_RECOVERY_MARKER: &str = ".content-index-recovery-v2";
+
+fn recovery_marker_valid(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|value| value == "v2\n")
+        .unwrap_or(false)
+}
+
+fn write_recovery_marker(path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(b"v2\n")?;
+    file.sync_all()?;
+    Ok(())
+}
 
 #[derive(Debug)]
 enum MetadataCommand {
@@ -380,6 +402,8 @@ impl StorageRuntime {
         });
 
         let recovery_segment = segment::latest_segment_path(&cfg.segment_dir)?;
+        let recovery_marker = cfg.segment_dir.join(CONTENT_INDEX_RECOVERY_MARKER);
+        let requires_full_index_recovery = !recovery_marker_valid(&recovery_marker);
         let segments = segment::SegmentStore::open(
             cfg.segment_dir.clone(),
             cfg.segment_max_bytes,
@@ -390,9 +414,25 @@ impl StorageRuntime {
             tx.clone(),
         )?;
 
-        // Recover index rows that may have been left between a segment fsync and
-        // metadata publication for the segment that was active at the last crash.
-        if let Some(path) = recovery_segment.filter(|path| path.exists()) {
+        if requires_full_index_recovery {
+            // Older releases could rotate a payload segment before its entire
+            // content-index batch was durably spooled.  Heal that historical
+            // crash window exactly once by rebuilding every retained segment.
+            // Duplicate rows are safe (content_index is replacing/deduplicated).
+            let recovery_segments = segments.clone();
+            let recovery_metadata = tx.clone();
+            let rebuilt = tokio::task::spawn_blocking(move || {
+                recovery_segments.rebuild_index(&recovery_metadata)
+            })
+            .await??;
+            let recovery_barrier = tx.clone();
+            tokio::task::spawn_blocking(move || recovery_barrier.durable_barrier()).await??;
+            let marker = recovery_marker.clone();
+            tokio::task::spawn_blocking(move || write_recovery_marker(&marker)).await??;
+            tracing::info!(rebuilt, "completed one-time full content-index recovery");
+        } else if let Some(path) = recovery_segment.filter(|path| path.exists()) {
+            // With crash-consistent rotation, only the segment that was active
+            // at the last crash can have bytes newer than durable index rows.
             let recovery_segments = segments.clone();
             let recovery_metadata = tx.clone();
             tokio::task::spawn_blocking(move || {

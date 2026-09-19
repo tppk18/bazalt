@@ -37,7 +37,9 @@ pub struct Metrics {
     pub match_queue_depth: AtomicU64,
     pub match_queue_capacity: AtomicU64,
     pub match_queue_high_watermark: AtomicU64,
+    pub matcher_queue_backpressure: AtomicU64,
     pub matcher_queue_drops: AtomicU64,
+    pub matcher_housekeeping_drops: AtomicU64,
     pub storage_queue_depth: AtomicU64,
     pub storage_queue_capacity: AtomicU64,
     pub storage_queue_high_watermark: AtomicU64,
@@ -137,7 +139,9 @@ impl Metrics {
             match_queue_depth: load!(match_queue_depth),
             match_queue_capacity: load!(match_queue_capacity),
             match_queue_high_watermark: load!(match_queue_high_watermark),
+            matcher_queue_backpressure: load!(matcher_queue_backpressure),
             matcher_queue_drops: load!(matcher_queue_drops),
+            matcher_housekeeping_drops: load!(matcher_housekeeping_drops),
             storage_queue_depth: load!(storage_queue_depth),
             storage_queue_capacity: load!(storage_queue_capacity),
             storage_queue_high_watermark: load!(storage_queue_high_watermark),
@@ -288,8 +292,18 @@ impl Metrics {
             "gauge"
         );
         metric!(
+            "matcher_queue_backpressure_total",
+            s.matcher_queue_backpressure,
+            "counter"
+        );
+        metric!(
             "matcher_queue_drops_total",
             s.matcher_queue_drops,
+            "counter"
+        );
+        metric!(
+            "matcher_housekeeping_drops_total",
+            s.matcher_housekeeping_drops,
             "counter"
         );
         metric!("storage_queue_depth", s.storage_queue_depth, "gauge");
@@ -435,7 +449,9 @@ pub struct MetricsSnapshot {
     pub match_queue_depth: u64,
     pub match_queue_capacity: u64,
     pub match_queue_high_watermark: u64,
+    pub matcher_queue_backpressure: u64,
     pub matcher_queue_drops: u64,
+    pub matcher_housekeeping_drops: u64,
     pub storage_queue_depth: u64,
     pub storage_queue_capacity: u64,
     pub storage_queue_high_watermark: u64,

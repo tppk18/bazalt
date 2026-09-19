@@ -21,11 +21,17 @@ use crate::{
     matching::MatcherIngress,
     metrics::Metrics,
     model::{
-        ContentRecord, ContentView, Direction, FlowId, FlowKey, FlowOutput, HttpRecord, MatchInput,
-        MetadataEvent, ServiceConfig, StreamChunk,
+        ContentRecord, ContentView, Direction, FlowId, FlowKey, FlowOutput, HttpRecord,
+        MetadataEvent, ParsedPacket, ServiceConfig, StreamChunk,
     },
     storage::segment::SegmentStore,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServicePacketScope {
+    pub destination: bool,
+    pub flow: bool,
+}
 
 pub struct ServiceRegistry {
     // Readers are on the packet hot path. Service edits are rare, so publish a
@@ -91,6 +97,33 @@ impl ServiceRegistry {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn accepts_port(&self, port: u16) -> bool {
+        self.by_port.load().contains_key(&port)
+    }
+
+    /// A source becomes topology-visible, and a new flow may be admitted, only
+    /// when the packet is actually addressed to one of the configured service
+    /// ports. This is deliberately directional: a hostile sender using source
+    /// port 80 must not look like traffic to our port 80.
+    #[inline]
+    pub fn packet_scope(&self, packet: &ParsedPacket) -> ServicePacketScope {
+        let current = self.by_port.load();
+        let destination = current.contains_key(&packet.destination_endpoint().port);
+        let source = current.contains_key(&packet.source_endpoint().port);
+        ServicePacketScope {
+            destination,
+            flow: destination || source,
+        }
+    }
+
+    #[inline]
+    pub fn accepts_destination(&self, packet: &ParsedPacket) -> bool {
+        self.by_port
+            .load()
+            .contains_key(&packet.destination_endpoint().port)
     }
 
     /// Capture semantics: traffic is accepted only if one side of the flow is a
@@ -364,7 +397,7 @@ fn l7_worker_loop(
                 // FlowClosed is recoverable housekeeping.  If the matcher is
                 // overloaded its bounded tail cache has an independent expiry;
                 // never let this analytical notification stop L7.
-                let _ = matcher_tx.try_send(MatchInput::FlowClosed(flow_id));
+                let _ = matcher_tx.try_flow_closed(flow_id);
             }
         }
     }
@@ -376,9 +409,10 @@ fn fanout_content(
     segments: &SegmentStore,
     _metrics: &Metrics,
 ) {
-    // Storage acceptance has higher priority than analytical latency. A slow
-    // matcher must never prevent an accepted payload from entering the durable
-    // segment pipeline; missed live work can be recovered by historical replay.
+    // Storage acceptance has higher priority than analytical latency. The
+    // payload is accepted into the bounded durable segment pipeline first; if
+    // the matcher is saturated, lossless matcher admission then backpressures
+    // L7 rather than silently discarding already-accepted content.
     let match_copy = matcher_tx
         .is_interested_view(record.view)
         .then(|| record.clone());
@@ -389,7 +423,7 @@ fn fanout_content(
     let Some(record) = match_copy else {
         return;
     };
-    let _ = matcher_tx.try_send(MatchInput::Content(record));
+    let _ = matcher_tx.send_content(record);
 }
 
 fn emit_http_event(
@@ -1964,10 +1998,36 @@ mod tests {
         }]);
         let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-        let (allowed, _) = FlowKey::canonical(a, 45000, b, 8080, TransportProtocol::Tcp);
+        let (allowed, allowed_dir) =
+            FlowKey::canonical(a, 45000, b, 8080, TransportProtocol::Tcp);
         let (denied, _) = FlowKey::canonical(a, 45000, b, 9999, TransportProtocol::Tcp);
+        let inbound = ParsedPacket {
+            ts_ns: 1,
+            key: allowed.clone(),
+            direction: allowed_dir,
+            seq: Some(1),
+            ack: Some(0),
+            flags: crate::model::TcpFlags::default(),
+            payload: Bytes::new(),
+            wire_len: 64,
+        };
+        let (spoof_key, spoof_dir) =
+            FlowKey::canonical(a, 8080, b, 9999, TransportProtocol::Tcp);
+        let spoofed_source_port = ParsedPacket {
+            ts_ns: 2,
+            key: spoof_key.clone(),
+            direction: spoof_dir,
+            seq: Some(1),
+            ack: Some(0),
+            flags: crate::model::TcpFlags::default(),
+            payload: Bytes::new(),
+            wire_len: 64,
+        };
         assert!(registry.accepts_flow(&allowed));
         assert!(!registry.accepts_flow(&denied));
+        assert!(registry.accepts_destination(&inbound));
+        assert!(registry.accepts_flow(&spoof_key));
+        assert!(!registry.accepts_destination(&spoofed_source_port));
         registry.delete(8080);
         assert!(registry.is_empty());
         assert!(!registry.accepts_flow(&allowed));
@@ -2035,7 +2095,7 @@ mod tests {
             topology_group_prefix_v4: 24,
             topology_source_ttl: std::time::Duration::from_secs(300),
             topology_max_sources: 65_536,
-            throttle_interface: None,
+            throttle_enabled: false,
             postgres_url: String::new(),
             clickhouse_url: String::new(),
             clickhouse_database: "x".into(),

@@ -106,7 +106,31 @@ impl SegmentStore {
                             &writer_metrics.segment_queue_high_watermark,
                             rx.len() as u64,
                         );
-                        match writer.write_record(&record) {
+                        let prepared = match writer.prepare_record(&record) {
+                            Ok(prepared) => prepared,
+                            Err(e) => {
+                                tracing::error!(error = %e, content_id = %record.id, "segment record preparation failed");
+                                fatal = true;
+                                continue;
+                            }
+                        };
+                        if writer.needs_rotation(prepared.encoded_len) {
+                            if let Err(e) = writer.check_rotation_budget(prepared.encoded_len) {
+                                tracing::error!(error=%e, content_id=%record.id, "segment disk budget cannot accommodate rotation");
+                                fatal = true;
+                                continue;
+                            }
+                            if let Err(e) = commit_and_rotate(
+                                &mut writer,
+                                &mut pending_index,
+                                &metadata_tx,
+                            ) {
+                                tracing::error!(error=%e, "segment rotation commit failed");
+                                fatal = true;
+                                continue;
+                            }
+                        }
+                        match writer.write_prepared(&record, prepared) {
                             Ok((path, offset, bytes)) => {
                                 writer_metrics.segment_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
                                 writer_metrics.segment_disk_bytes.store(writer.retained_bytes, Ordering::Relaxed);
@@ -143,8 +167,7 @@ impl SegmentStore {
                     }
                     Ok(SegmentCommand::Seal(reply)) => {
                         let result = (|| -> Result<Vec<PathBuf>> {
-                            flush_and_publish(&mut writer, &mut pending_index, &metadata_tx, true)?;
-                            writer.rotate()?;
+                            commit_and_rotate(&mut writer, &mut pending_index, &metadata_tx)?;
                             let active = writer.path.clone();
                             let mut paths = list_segments(&writer.root)?;
                             paths.retain(|p| p != &active);
@@ -457,12 +480,43 @@ fn flush_and_publish(
     } else {
         writer.flush_visible()?;
     }
-    for index in pending.drain(..) {
-        metadata_tx
-            .send(MetadataEvent::ContentIndex(index))
-            .map_err(|e| anyhow::anyhow!("metadata writer stopped: {e}"))?;
+    // Never drain unsent index rows.  If the metadata writer stops midway,
+    // remove only the prefix it actually accepted and leave the remainder in
+    // memory for the caller/final recovery path.
+    let mut published = 0usize;
+    while published < pending.len() {
+        let index = pending[published].clone();
+        if let Err(e) = metadata_tx.send(MetadataEvent::ContentIndex(index)) {
+            if published != 0 {
+                pending.drain(..published);
+            }
+            return Err(anyhow::anyhow!("metadata writer stopped: {e}"));
+        }
+        published += 1;
+    }
+    if published != 0 {
+        pending.drain(..published);
     }
     Ok(())
+}
+
+/// Commit the current segment as one crash-consistent unit before opening the
+/// next file.  Once `rotate_after_commit` runs, every index row for the old
+/// segment is already durable in the local metadata spool.
+fn commit_and_rotate(
+    writer: &mut ActiveWriter,
+    pending: &mut Vec<ContentIndexRecord>,
+    metadata_tx: &crate::storage::MetadataSink,
+) -> Result<()> {
+    flush_and_publish(writer, pending, metadata_tx, true)?;
+    metadata_tx.durable_barrier()?;
+    writer.rotate_after_commit()
+}
+
+struct PreparedRecord {
+    prefix: Vec<u8>,
+    payload_len: usize,
+    encoded_len: usize,
 }
 
 struct ActiveWriter {
@@ -500,18 +554,26 @@ impl ActiveWriter {
         })
     }
 
-    fn rotate(&mut self) -> Result<()> {
-        self.flush_sync()?;
+    fn rotate_after_commit(&mut self) -> Result<()> {
+        if self.retained_bytes.saturating_add(HEADER_SIZE) > self.store_max_bytes {
+            bail!(
+                "segment disk budget exhausted while rotating: {} + {} > {}",
+                self.retained_bytes,
+                HEADER_SIZE,
+                self.store_max_bytes
+            );
+        }
         let (path, file) = create_segment(&self.root)?;
         let mut file = BufWriter::with_capacity(4 * 1024 * 1024, file);
         write_header(&mut file)?;
         self.path = path;
         self.file = file;
         self.bytes = HEADER_SIZE;
+        self.retained_bytes = self.retained_bytes.saturating_add(HEADER_SIZE);
         Ok(())
     }
 
-    fn write_record(&mut self, record: &ContentRecord) -> Result<(PathBuf, u64, usize)> {
+    fn prepare_record(&self, record: &ContentRecord) -> Result<PreparedRecord> {
         let prefix = encode_record_prefix(record)?;
         let payload_len = prefix.len().saturating_add(record.data.len());
         if payload_len > u32::MAX as usize {
@@ -532,21 +594,59 @@ impl ActiveWriter {
                 self.store_max_bytes
             );
         }
-        if self.bytes > HEADER_SIZE && self.bytes + encoded_len as u64 > self.max_bytes {
-            self.rotate()?;
+        Ok(PreparedRecord {
+            prefix,
+            payload_len,
+            encoded_len,
+        })
+    }
+
+    #[inline]
+    fn needs_rotation(&self, encoded_len: usize) -> bool {
+        self.bytes > HEADER_SIZE && self.bytes + encoded_len as u64 > self.max_bytes
+    }
+
+    fn check_rotation_budget(&self, encoded_len: usize) -> Result<()> {
+        let required = HEADER_SIZE.saturating_add(encoded_len as u64);
+        if self.retained_bytes.saturating_add(required) > self.store_max_bytes {
+            bail!(
+                "segment disk budget exhausted by rotation: {} + {} > {}",
+                self.retained_bytes,
+                required,
+                self.store_max_bytes
+            );
+        }
+        Ok(())
+    }
+
+    fn write_prepared(
+        &mut self,
+        record: &ContentRecord,
+        prepared: PreparedRecord,
+    ) -> Result<(PathBuf, u64, usize)> {
+        if self.retained_bytes.saturating_add(prepared.encoded_len as u64) > self.store_max_bytes {
+            bail!(
+                "segment disk budget exhausted: {} + {} > {}",
+                self.retained_bytes,
+                prepared.encoded_len,
+                self.store_max_bytes
+            );
         }
         let offset = self.file.stream_position()?;
         let mut crc = Hasher::new();
-        crc.update(&prefix);
+        crc.update(&prepared.prefix);
         crc.update(&record.data);
         self.file.write_all(&RECORD_MAGIC.to_le_bytes())?;
-        self.file.write_all(&(payload_len as u32).to_le_bytes())?;
+        self.file
+            .write_all(&(prepared.payload_len as u32).to_le_bytes())?;
         self.file.write_all(&crc.finalize().to_le_bytes())?;
-        self.file.write_all(&prefix)?;
+        self.file.write_all(&prepared.prefix)?;
         self.file.write_all(&record.data)?;
-        self.bytes += encoded_len as u64;
-        self.retained_bytes = self.retained_bytes.saturating_add(encoded_len as u64);
-        Ok((self.path.clone(), offset, encoded_len))
+        self.bytes += prepared.encoded_len as u64;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(prepared.encoded_len as u64);
+        Ok((self.path.clone(), offset, prepared.encoded_len))
     }
 
     fn flush_visible(&mut self) -> Result<()> {
@@ -1014,6 +1114,110 @@ mod tests {
             .read_at(Path::new(&index.segment_path), index.segment_offset)
             .unwrap();
         assert_eq!(got.data.as_ref(), b"payload");
+    }
+
+    fn test_index(id: Uuid, path: &Path, offset: u64) -> ContentIndexRecord {
+        ContentIndexRecord {
+            content_id: id,
+            flow_id: Uuid::new_v4(),
+            ts_ns: 1,
+            service: None,
+            direction: Direction::AToB,
+            view: ContentView::TcpRaw,
+            stream_offset: 0,
+            payload_len: 1,
+            segment_path: path.to_string_lossy().into_owned(),
+            segment_offset: offset,
+        }
+    }
+
+    #[test]
+    fn metadata_send_failure_preserves_unsent_index_suffix() {
+        let dir = tempdir().unwrap();
+        let mut writer = ActiveWriter::new(
+            dir.path(),
+            1024 * 1024,
+            512 * 1024,
+            16 * 1024 * 1024,
+            0,
+        )
+        .unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut pending = vec![
+            test_index(first, &writer.path, HEADER_SIZE),
+            test_index(second, &writer.path, HEADER_SIZE + 1),
+        ];
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let sink = crate::storage::MetadataSink { tx };
+        let receiver = std::thread::spawn(move || {
+            let _ = rx.recv().unwrap();
+            // Dropping here makes the second send fail after exactly one event
+            // was accepted by the metadata channel.
+        });
+        let err = flush_and_publish(&mut writer, &mut pending, &sink, false).unwrap_err();
+        receiver.join().unwrap();
+        assert!(err.to_string().contains("metadata writer stopped"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content_id, second);
+    }
+
+    #[test]
+    fn rotation_waits_for_durable_metadata_barrier() {
+        let dir = tempdir().unwrap();
+        let mut writer = ActiveWriter::new(
+            dir.path(),
+            1024 * 1024,
+            512 * 1024,
+            16 * 1024 * 1024,
+            0,
+        )
+        .unwrap();
+        let record = ContentRecord {
+            id: Uuid::new_v4(),
+            flow_id: Uuid::new_v4(),
+            ts_ns: 1,
+            service: None,
+            direction: Direction::AToB,
+            view: ContentView::TcpRaw,
+            stream_offset: 0,
+            data: bytes::Bytes::from_static(b"payload"),
+        };
+        let prepared = writer.prepare_record(&record).unwrap();
+        let (old_path, offset, _) = writer.write_prepared(&record, prepared).unwrap();
+        let mut pending = vec![test_index(record.id, &old_path, offset)];
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let sink = crate::storage::MetadataSink { tx };
+        let root = dir.path().to_path_buf();
+        let receiver = std::thread::spawn(move || {
+            match rx.recv().unwrap() {
+                crate::storage::MetadataCommand::Event(MetadataEvent::ContentIndex(index)) => {
+                    // Index publication happens only after the payload is
+                    // flushed from BufWriter and can be read independently.
+                    let mut file = BufReader::new(File::open(&index.segment_path).unwrap());
+                    read_header(&mut file).unwrap();
+                    file.seek(SeekFrom::Start(index.segment_offset)).unwrap();
+                    assert!(read_record(&mut file, 512 * 1024, None).unwrap().is_some());
+                }
+                other => panic!("unexpected metadata command: {other:?}"),
+            }
+            match rx.recv().unwrap() {
+                crate::storage::MetadataCommand::Barrier { projected, reply } => {
+                    assert!(!projected);
+                    // The next segment must not exist until this durable barrier
+                    // is acknowledged.
+                    assert_eq!(list_segments(&root).unwrap().len(), 1);
+                    reply.send(Ok(())).unwrap();
+                }
+                other => panic!("unexpected metadata command: {other:?}"),
+            }
+        });
+
+        commit_and_rotate(&mut writer, &mut pending, &sink).unwrap();
+        receiver.join().unwrap();
+        assert!(pending.is_empty());
+        assert_ne!(writer.path, old_path);
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 2);
     }
 
     #[test]

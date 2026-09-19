@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    http::L7Ingress,
+    http::{L7Ingress, ServiceRegistry},
     metrics::Metrics,
     model::{
         Direction, FlowKey, FlowOutput, FlowSummary, ParsedPacket, StreamChunk, TransportProtocol,
@@ -120,7 +120,12 @@ pub struct FlowRuntime {
 }
 
 impl FlowRuntime {
-    pub fn spawn(cfg: Arc<Config>, metrics: Arc<Metrics>, l7: L7Ingress) -> anyhow::Result<Self> {
+    pub fn spawn(
+        cfg: Arc<Config>,
+        metrics: Arc<Metrics>,
+        l7: L7Ingress,
+        services: Arc<ServiceRegistry>,
+    ) -> anyhow::Result<Self> {
         let per_shard_capacity = (cfg.capture_to_flow_capacity / cfg.flow_shards.max(1)).max(1);
         metrics.flow_queue_capacity.store(
             (per_shard_capacity * cfg.flow_shards.max(1)) as u64,
@@ -135,6 +140,7 @@ impl FlowRuntime {
             let cfg2 = cfg.clone();
             let metrics2 = metrics.clone();
             let out2 = l7.clone();
+            let services2 = services.clone();
             let flow_cpu = if cfg.flow_cpus.is_empty() {
                 None
             } else {
@@ -150,7 +156,7 @@ impl FlowRuntime {
                             Err(e) => tracing::warn!(shard_id, cpu, error=%e, "cannot pin flow worker"),
                         }
                     }
-                    shard_loop(shard_id, cfg2, metrics2, rx, out2)
+                    shard_loop(shard_id, cfg2, metrics2, rx, out2, services2)
                 })?);
         }
 
@@ -370,6 +376,7 @@ fn shard_loop(
     metrics: Arc<Metrics>,
     rx: Receiver<ParsedPacket>,
     output: L7Ingress,
+    services: Arc<ServiceRegistry>,
 ) {
     let mut flows: AHashMap<FlowKey, FlowState> = AHashMap::new();
     let mut tombstones = TcpTombstones::new();
@@ -428,6 +435,17 @@ fn shard_loop(
                 let (state, is_new_flow) = match flows.entry(key.clone()) {
                     Entry::Occupied(entry) => (entry.into_mut(), false),
                     Entry::Vacant(entry) => {
+                        // A new flow is created only after traffic is actually
+                        // addressed to a configured service port. Existing
+                        // flows still accept the reverse direction, but a
+                        // hostile packet whose *source* port happens to equal a
+                        // service port cannot allocate flow/L7 state.
+                        if !services.accepts_destination(&packet) {
+                            metrics
+                                .packets_filtered
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if !try_admit_flow(&metrics, cfg.max_active_flows) {
                             metrics
                                 .flow_state_rejections
@@ -447,6 +465,14 @@ fn shard_loop(
                         (entry.insert(FlowState::new(&packet)), true)
                     }
                 };
+                // These counters represent packets that actually entered an
+                // admitted service flow, not every frame returned by capture.
+                // Reverse packets of an established service flow are included;
+                // off-service/source-port-collision packets are not.
+                metrics.packets_received.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .packet_bytes
+                    .fetch_add(packet.wire_len as u64, Ordering::Relaxed);
                 state.count_packet(&packet);
 
                 let mut emitted_content = false;

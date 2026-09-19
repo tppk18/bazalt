@@ -67,7 +67,7 @@
         <div class="resource-bar"><span id="resource-pressure-bar"></span></div>
       </div>
       <div class="resource-card" id="resource-ingress-card">
-        <div class="resource-card-label">PACKET CAPTURE RATE</div>
+        <div class="resource-card-label">CAPTURE BACKEND RATE</div>
         <div class="resource-card-value" id="resource-ingress">--</div>
         <div class="resource-card-meta" id="resource-ingress-meta">--</div>
         <div class="resource-bar resource-bar-passive"><span></span></div>
@@ -95,7 +95,7 @@
     <div class="management-head">
       <div>
         <h2>TRAFFIC TOPOLOGY</h2>
-        <p>Automatic IPv4 source grouping. Groups are derived from observed source addresses; no team list is required.</p>
+        <p>Service-scoped IPv4 ingress. Only traffic addressed to added service ports enters topology/statistics; throttle rules then apply source-wide.</p>
       </div>
       <div class="management-actions">
         <button class="btn btn-secondary btn-sm" id="topology-refresh" type="button">REFRESH</button>
@@ -115,7 +115,7 @@
         <small id="topology-source-ttl">--</small>
       </div>
       <div class="management-card">
-        <span class="management-card-label">OBSERVED RATE</span>
+        <span class="management-card-label">SERVICE INGRESS</span>
         <strong id="topology-ingress-rate">--</strong>
         <small id="topology-ingress-pps">--</small>
       </div>
@@ -129,9 +129,24 @@
     <div class="topology-enforcement-note" id="topology-enforcement-note"></div>
     <div class="topology-enforcement-note warn hidden" id="topology-capacity-note"></div>
     <div class="topology-enforcement-note warn hidden" id="topology-view-note"></div>
-    <div class="topology-groups" id="topology-groups">
-      <div class="topology-empty">Waiting for IPv4 traffic…</div>
-    </div>
+    <section class="topology-map-section">
+      <div class="management-section-head"><div><h3>LIVE STAR MAP</h3><p>Center = configured service ports. Rays = automatically discovered IPv4 source groups.</p></div></div>
+      <div class="topology-star" id="topology-star">
+        <div class="topology-empty">Waiting for service traffic…</div>
+      </div>
+    </section>
+
+    <section class="topology-detail-section">
+      <div class="management-section-head"><div><h3>GROUP DETAILS</h3><p>Per-source rates and throttle controls for the same service-scoped traffic.</p></div></div>
+      <div class="topology-groups" id="topology-groups">
+        <div class="topology-empty">Waiting for service traffic…</div>
+      </div>
+    </section>
+
+    <section class="management-section topology-audit-section">
+      <div class="management-section-head"><div><h3>ACTIVE THROTTLE RULES</h3><p>Kernel rules remain visible here even when 100% drop makes a source disappear from passive capture.</p></div></div>
+      <div class="management-table-wrap"><table class="management-table"><thead><tr><th>TARGET</th><th>DROP</th><th>EXPIRES</th><th>MATCHED</th><th>DROPPED</th><th>ACTION</th></tr></thead><tbody id="topology-rules-body"><tr><td colspan="6">No active throttle rules.</td></tr></tbody></table></div>
+    </section>
 
     <section class="management-section topology-audit-section">
       <div class="management-section-head"><div><h3>RECENT ENFORCEMENT</h3><p>Bounded in-memory audit of throttle changes and TTL expiry.</p></div></div>
@@ -285,7 +300,7 @@
           <div class="throttle-target" id="throttle-target-label">--</div>
           <input type="hidden" name="target" id="throttle-target">
           <div class="form-row"><label>DROP</label><div class="throttle-percent"><input type="range" id="throttle-percent-range" min="1" max="100" value="25"><input type="number" name="drop_percent" id="throttle-percent" min="1" max="100" value="25" required><span>%</span></div></div>
-          <div class="form-row"><label>DURATION</label><select name="ttl_seconds" id="throttle-ttl"><option value="60">1 minute</option><option value="300" selected>5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option><option value="0">Until disabled</option></select></div>
+          <div class="form-row"><label>DURATION</label><select name="ttl_seconds" id="throttle-ttl"><option value="60">1 minute</option><option value="300" selected>5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option></select></div>
           <p class="throttle-warning">This is real ingress enforcement: matching IPv4 packets are probabilistically dropped by XDP at the configured percentage before the normal network stack.</p>
         </div>
         <div class="modal-footer"><button type="button" class="btn btn-danger hidden" id="throttle-disable">DISABLE</button><button type="button" class="btn btn-secondary" data-close="throttle-modal">CANCEL</button><button type="submit" class="btn btn-primary">APPLY</button></div>

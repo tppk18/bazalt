@@ -180,9 +180,9 @@ GET /api/live
 
 ## IPv4 traffic topology / throttle
 
-`GET /api/topology` returns a live in-memory view of observed IPv4 source traffic. Sources are grouped automatically by `BAZALT_TOPOLOGY_GROUP_PREFIX_V4` (default `/24`). The response contains per-group and per-source cumulative bytes/packets plus 5-second PPS/bit-rate estimates. Traffic is observed before the configured service-port allow-list, so off-service spam remains visible. Per-source state is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`); overflow traffic remains included in aggregate totals/rates and is exposed via the `untracked_*` fields. To keep the control plane responsive during high-cardinality floods, a snapshot returns at most the 256 busiest groups and 2048 busiest source rows. `group_count`, `source_count`, aggregate totals/rates, `returned_*` fields and `view_truncated` make this explicit rather than silently losing accounting.
+`GET /api/topology` returns a live in-memory view of remote IPv4 traffic addressed to configured service destination ports. Sources are grouped automatically by `BAZALT_TOPOLOGY_GROUP_PREFIX_V4` (default `/24`). The response contains per-group and per-source cumulative bytes/packets plus 5-second PPS/bit-rate estimates and a top-level `service_ports` array used by the star-map center. Off-service traffic is intentionally absent from topology/statistics. Per-source state is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`); overflow of service-directed traffic remains included in aggregate totals/rates and is exposed via the `untracked_*` fields. To keep the control plane responsive during high-cardinality floods, a snapshot returns at most the 256 busiest groups and 2048 busiest source rows. `group_count`, `source_count`, aggregate totals/rates, `returned_*` fields and `view_truncated` make this explicit rather than silently losing accounting.
 
-The response also includes `enforcement`: whether XDP throttle is available, the configured enforcement interface, active rules and recent in-memory audit entries.
+The response also includes `enforcement`: whether XDP throttle is available, `BAZALT_INTERFACE`, the effective XDP attach mode (`native-link`, `native-netlink`, or `generic-skb-netlink`), active rules and recent in-memory audit entries. Topology filtering does not constrain enforcement: after a rule is installed, its XDP LPM lookup is keyed only by source IPv4/prefix, so the selected drop percentage applies to all destination ports from that source.
 
 `PUT /api/topology/throttle` installs/replaces a probabilistic IPv4 source drop rule:
 
@@ -190,7 +190,7 @@ The response also includes `enforcement`: whether XDP throttle is available, the
 {"target":"10.10.1.23","drop_percent":50,"ttl_seconds":300}
 ```
 
-`target` may be one IPv4 address (`/32`) or a CIDR such as `10.10.1.0/24`. For safety, the API rejects targets broader than the configured automatic group prefix, so the default `/24` layout cannot accidentally install `/16`, `/8` or `/0` penalties. `drop_percent` is `1..100`. `ttl_seconds=0` means until explicitly disabled; omitted TTL defaults to 300 seconds and non-zero TTL is capped at seven days.
+`target` may be one IPv4 address (`/32`) or exactly one automatically discovered group CIDR such as `10.10.1.0/24`. Intermediate or broader prefixes are rejected, so the default `/24` layout cannot accidentally install `/25`, `/16`, `/8` or `/0` penalties. `drop_percent` is `1..100`. `ttl_seconds` must be `1..3600`; omitted TTL defaults to 300 seconds. Permanent packet-drop rules are deliberately unsupported so a userspace crash cannot leave an indefinite punishment behind.
 
 `DELETE /api/topology/throttle` removes a rule:
 
@@ -198,4 +198,4 @@ The response also includes `enforcement`: whether XDP throttle is available, the
 {"target":"10.10.1.23"}
 ```
 
-The throttle endpoint returns `503` when `BAZALT_THROTTLE_INTERFACE` is not configured. In AF_XDP capture mode the enforcement interface must differ from `BAZALT_INTERFACE` so the throttle program cannot replace or interfere with the capture XDP/XSK attachment.
+The throttle endpoint returns `503` when `BAZALT_THROTTLE_ENABLED=false`. Enforcement always attaches to `BAZALT_INTERFACE`; no independent throttle interface is configurable. If AF_XDP was requested while enforcement is enabled, BAZALT uses the throttle XDP program for ingress enforcement and automatically selects passive libpcap as the effective capture backend.

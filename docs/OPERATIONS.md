@@ -140,7 +140,7 @@ curl -s http://127.0.0.1:65000/metrics | \
 
 - растёт `bazalt_capture_backend_drops_total` — кадры теряются до нормального userspace parsing (AF_XDP/libpcap/kernel path);
 - растёт `bazalt_capture_drops_total` — заполнено ребро `capture -> flow` даже после bounded wait;
-- растёт `bazalt_packets_filtered_total` — пакет корректный, но его порт отсутствует в service allow-list;
+- растёт `bazalt_packets_filtered_total` — кадр/пакет отсечён service allow-list (включая дешёвый pre-decode gate для обычного off-service IPv4);
 - растёт `bazalt_packets_ignored_total` — unsupported EtherType/L4/tunnel traffic; IP fragments учитываются отдельными fragment metrics;
 - растёт `bazalt_packet_parse_errors_total` — malformed/truncated frame;
 - `capture_frames_total` не растёт при известном входящем трафике — проверять interface/RSS/XDP redirect и выбранные RX queues.
@@ -276,11 +276,11 @@ BAZALT_TUNNEL_DECAPSULATION=true
 - `bazalt_tcp_gap_events_total` / `bazalt_tcp_gap_bytes_total` — BAZALT ACK-inferred/timeout/pressure/close recovery зафиксировал stream discontinuity и продолжил после gap;
 - `bazalt_tcp_rejected_resets_total` — RST не совпал с ожидаемым receive-next и не разрушил flow state.
 
-При `BAZALT_EARLY_PORT_FILTER=true` BPF специально пропускает fragments, поддерживаемые tunnel encapsulations и tagged Ethernet frames; окончательный service-port allow-list применяется после reassembly/decapsulation. Если service list пуст, BPF дропает всё ещё в kernel.
+`BAZALT_EARLY_PORT_FILTER=true` теперь является рекомендуемым/default режимом для backends, которые умеют dynamic BPF. Off-service traffic не должен попадать в participant analysis/topology; userspace всё равно повторяет service-port решение после bounded fragment/tunnel decoding, поэтому ранний BPF остаётся только оптимизацией.
 
 ## Traffic topology and XDP throttle
 
-Topology requires no team configuration. With defaults, observed IPv4 source addresses `10.10.1.x` appear under `10.10.1.0/24`, `10.10.2.x` under `10.10.2.0/24`, and a lone `10.10.10.10` appears as the only active member of `10.10.10.0/24`.
+Topology requires no team configuration. A source appears only after it sends traffic to an added service destination port. With defaults, such IPv4 sources `10.10.1.x` appear under `10.10.1.0/24`, `10.10.2.x` under `10.10.2.0/24`, and a lone `10.10.10.10` appears as the only active member of `10.10.10.0/24`. The UI presents these groups as rays around a center containing the configured service ports.
 
 ```env
 BAZALT_TOPOLOGY_GROUP_PREFIX_V4=24
@@ -291,11 +291,13 @@ BAZALT_TOPOLOGY_MAX_SOURCES=65536
 Topology alone is safe to enable everywhere. Packet enforcement is opt-in:
 
 ```env
-BAZALT_THROTTLE_INTERFACE=game-ingress0
+# Common inline setup: same interface is used for observation and punishment.
+BAZALT_INTERFACE=eth0
+BAZALT_THROTTLE_ENABLED=true
 ```
 
-The interface must be a point where dropping ingress packets actually affects the participant. A SPAN/mirror-only capture interface cannot punish the sender. In AF_XDP mode BAZALT rejects startup when `BAZALT_THROTTLE_INTERFACE` equals `BAZALT_INTERFACE`; use a real forwarding/ingress interface for enforcement.
+`BAZALT_INTERFACE` must be the ingress point where dropping packets actually affects the participant. A SPAN/mirror-only interface cannot punish the sender. Enforcement is intentionally same-interface only: there is no separate throttle-interface variable. When throttle is enabled and AF_XDP capture was requested, BAZALT preserves the throttle XDP program on ingress and uses passive libpcap as the effective capture backend. This avoids competing XDP programs and preserves the host network stack for `XDP_PASS` packets. This is a deliberate backend selection rather than an AF_XDP failure, so it applies even when `BAZALT_CAPTURE_FALLBACK_PCAP=false`. BAZALT prefers BPF-link ownership. If that attach path is unavailable, it uses legacy netlink; netlink can still be native, or can select generic/SKB on drivers without native XDP.
 
-The UI allows throttling either an automatically discovered `/24` group or one `/32` source. The API also refuses any target broader than the configured automatic group prefix, preventing an accidental `/16`, `/8` or `/0` penalty with the default layout. Prefer a finite TTL for operator actions. `100%` is a full block; lower values are probabilistic packet loss. The kernel counters shown for a rule are enforcement-interface counters and therefore can differ from the passive capture counters when the two interfaces observe different points in the network.
+The UI allows throttling either an automatically discovered group prefix (`/24` by default) or one `/32` source. Visibility is service-scoped, but the punishment is intentionally source-wide: once a rule is installed, XDP applies the percentage to every IPv4 packet from that source/prefix regardless of destination port. The API rejects every other prefix, including broader ranges (`/16`, `/8`, `/0`) and hidden partial-team ranges such as `/25`. Every operator action requires a finite TTL from 1 to 3600 seconds. `100%` is a full block; lower values are probabilistic packet loss. With enforcement enabled, libpcap sees only `XDP_PASS` packets, while each rule's kernel counters include all packets that matched that rule before the drop decision. The live libpcap topology also suppresses frames whose Ethernet source MAC is the local interface, so the host's own outbound traffic is not presented as an attacker/source group.
 
 `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`) bounds per-source topology memory. If the cap is reached (for example, during a spoofed-source flood), the UI reports overflow PPS/BPS while keeping total observed accounting intact.

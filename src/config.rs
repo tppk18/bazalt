@@ -43,6 +43,18 @@ impl CaptureMode {
     }
 }
 
+/// Resolve the capture backend that can coexist with ingress enforcement.
+/// AF_XDP capture owns the interface XDP hook and redirects packets into XSK,
+/// while same-interface throttle must own that hook to decide XDP_DROP/XDP_PASS.
+/// For that one combination capture therefore becomes passive libpcap.
+pub fn effective_capture_mode(requested: CaptureMode, throttle_enabled: bool) -> CaptureMode {
+    if requested == CaptureMode::AfXdp && throttle_enabled {
+        CaptureMode::PcapLive
+    } else {
+        requested
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -121,10 +133,12 @@ pub struct Config {
     pub topology_source_ttl: Duration,
     /// Bound source-cardinality state so spoofed source floods cannot grow memory indefinitely.
     pub topology_max_sources: usize,
-    /// Optional ingress interface where the XDP throttle program is attached.
-    /// In AF_XDP mode this must differ from the capture interface so enforcement cannot
-    /// replace or disrupt the XSK capture program.
-    pub throttle_interface: Option<String>,
+    /// Real packet enforcement is always attached to `interface`. Keeping the
+    /// interface implicit prevents configurations that observe one link while
+    /// accidentally dropping packets on another. When enabled together with
+    /// requested AF_XDP capture, capture becomes passive libpcap so the throttle
+    /// program remains the only XDP ingress owner.
+    pub throttle_enabled: bool,
     pub postgres_url: String,
     pub clickhouse_url: String,
     pub clickhouse_database: String,
@@ -145,15 +159,22 @@ impl Config {
             .context("BAZALT_LISTEN must be a socket address")?;
         let capture_mode = CaptureMode::parse(&env_or("PACKMATE_CAPTURE_MODE", "afxdp"))?;
         let interface = env_or("PACKMATE_INTERFACE", "eth0");
+        let throttle_enabled = parse_bool_env("PACKMATE_THROTTLE_ENABLED", false)?;
+        if throttle_enabled && matches!(capture_mode, CaptureMode::PcapFile | CaptureMode::Disabled) {
+            anyhow::bail!(
+                "BAZALT_THROTTLE_ENABLED requires live capture; pcap-file/disabled modes cannot enforce ingress traffic"
+            );
+        }
+        let planned_capture_mode = effective_capture_mode(capture_mode, throttle_enabled);
         let pcap_file = env_os("PACKMATE_PCAP_FILE").map(PathBuf::from);
         if capture_mode == CaptureMode::PcapFile && pcap_file.is_none() {
             anyhow::bail!("BAZALT_PCAP_FILE is required in pcap-file mode");
         }
 
-        let queue_ids = parse_queue_ids(&interface, capture_mode)?;
+        let queue_ids = parse_queue_ids(&interface, planned_capture_mode)?;
         let cpu_auto = parse_bool_env("PACKMATE_CPU_AUTO", true)?;
         let requested_budget = parse_optional_env::<usize>("PACKMATE_CPU_BUDGET")?;
-        let capture_hint = match capture_mode {
+        let capture_hint = match planned_capture_mode {
             CaptureMode::Disabled => 0,
             CaptureMode::PcapLive | CaptureMode::PcapFile => 1,
             CaptureMode::AfXdp => queue_ids.len().max(1),
@@ -285,15 +306,10 @@ impl Config {
         if topology_max_sources == 0 {
             anyhow::bail!("BAZALT_TOPOLOGY_MAX_SOURCES must be greater than zero");
         }
-        let throttle_interface = env_value("PACKMATE_THROTTLE_INTERFACE");
-        if capture_mode == CaptureMode::AfXdp
-            && throttle_interface.as_deref() == Some(interface.as_str())
-        {
-            anyhow::bail!(
-                "BAZALT_THROTTLE_INTERFACE must differ from BAZALT_INTERFACE in AF_XDP mode; attach enforcement at the real ingress/forwarding point, not the capture XSK interface"
-            );
-        }
-
+        // Service-port scoping is authoritative for analysis and topology.
+        // Enable the backend filter by default when supported; userspace still
+        // repeats the decision after reassembly/decapsulation for correctness.
+        let early_port_filter = parse_bool_env("PACKMATE_EARLY_PORT_FILTER", true)?;
         Ok(Self {
             listen,
             capture_mode,
@@ -321,10 +337,9 @@ impl Config {
                 250u64,
             )?),
             capture_fallback_pcap: parse_bool_env("PACKMATE_CAPTURE_FALLBACK_PCAP", true)?,
-            // Keep the service-port allow-list authoritative in userspace by default.
-            // Early libpcap BPF is optional because a backend/link-layer mismatch can
-            // otherwise make capture look completely dead (zero frames, zero parse errors).
-            early_port_filter: parse_bool_env("PACKMATE_EARLY_PORT_FILTER", false)?,
+            // Kernel/libpcap filtering is an optimization only. The userspace
+            // service gate remains authoritative after fragment/tunnel decoding.
+            early_port_filter,
             capture_to_flow_capacity: parse_env("PACKMATE_CAPTURE_QUEUE", 32768)?,
             flow_to_l7_capacity: parse_env("PACKMATE_FLOW_QUEUE", 16384)?,
             l7_to_match_capacity: parse_env("PACKMATE_MATCH_QUEUE", 16384)?,
@@ -388,7 +403,7 @@ impl Config {
             topology_group_prefix_v4,
             topology_source_ttl: Duration::from_secs(topology_source_ttl_secs),
             topology_max_sources,
-            throttle_interface,
+            throttle_enabled,
             postgres_url: env_or(
                 "PACKMATE_POSTGRES_URL",
                 "postgres://packmate:packmate@127.0.0.1:65001/packmate",
@@ -558,6 +573,22 @@ fn default_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_throttle_forces_passive_capture() {
+        assert_eq!(
+            effective_capture_mode(CaptureMode::AfXdp, true),
+            CaptureMode::PcapLive
+        );
+        assert_eq!(
+            effective_capture_mode(CaptureMode::AfXdp, false),
+            CaptureMode::AfXdp
+        );
+        assert_eq!(
+            effective_capture_mode(CaptureMode::PcapLive, true),
+            CaptureMode::PcapLive
+        );
+    }
 
     #[test]
     fn parses_capture_modes() {
