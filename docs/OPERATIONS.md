@@ -277,3 +277,25 @@ BAZALT_TUNNEL_DECAPSULATION=true
 - `bazalt_tcp_rejected_resets_total` — RST не совпал с ожидаемым receive-next и не разрушил flow state.
 
 При `BAZALT_EARLY_PORT_FILTER=true` BPF специально пропускает fragments, поддерживаемые tunnel encapsulations и tagged Ethernet frames; окончательный service-port allow-list применяется после reassembly/decapsulation. Если service list пуст, BPF дропает всё ещё в kernel.
+
+## Traffic topology and XDP throttle
+
+Topology requires no team configuration. With defaults, observed IPv4 source addresses `10.10.1.x` appear under `10.10.1.0/24`, `10.10.2.x` under `10.10.2.0/24`, and a lone `10.10.10.10` appears as the only active member of `10.10.10.0/24`.
+
+```env
+BAZALT_TOPOLOGY_GROUP_PREFIX_V4=24
+BAZALT_TOPOLOGY_SOURCE_TTL_SECS=300
+BAZALT_TOPOLOGY_MAX_SOURCES=65536
+```
+
+Topology alone is safe to enable everywhere. Packet enforcement is opt-in:
+
+```env
+BAZALT_THROTTLE_INTERFACE=game-ingress0
+```
+
+The interface must be a point where dropping ingress packets actually affects the participant. A SPAN/mirror-only capture interface cannot punish the sender. In AF_XDP mode BAZALT rejects startup when `BAZALT_THROTTLE_INTERFACE` equals `BAZALT_INTERFACE`; use a real forwarding/ingress interface for enforcement.
+
+The UI allows throttling either an automatically discovered `/24` group or one `/32` source. The API also refuses any target broader than the configured automatic group prefix, preventing an accidental `/16`, `/8` or `/0` penalty with the default layout. Prefer a finite TTL for operator actions. `100%` is a full block; lower values are probabilistic packet loss. The kernel counters shown for a rule are enforcement-interface counters and therefore can differ from the passive capture counters when the two interfaces observe different points in the network.
+
+`BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`) bounds per-source topology memory. If the cap is reached (for example, during a spoofed-source flood), the UI reports overflow PPS/BPS while keeping total observed accounting intact.

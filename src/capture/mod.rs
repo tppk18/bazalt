@@ -23,6 +23,7 @@ use crate::{
     flow::FlowIngress,
     http::ServiceRegistry,
     metrics::Metrics,
+    topology::TopologyTracker,
 };
 
 use fragment::SharedFragmentCache;
@@ -101,6 +102,7 @@ pub fn spawn_capture_workers(
     flow_tx: FlowIngress,
     metrics: Arc<Metrics>,
     services: Arc<ServiceRegistry>,
+    topology: Arc<TopologyTracker>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<CaptureRuntime> {
     if cfg.capture_mode == CaptureMode::Disabled {
@@ -191,6 +193,7 @@ pub fn spawn_capture_workers(
         let tx = flow_tx.clone();
         let metrics = metrics.clone();
         let services = services.clone();
+        let topology = topology.clone();
         let shutdown2 = shutdown.clone();
         capture_handles.push(std::thread::Builder::new()
             .name(format!("capture-{queue_id}"))
@@ -206,6 +209,7 @@ pub fn spawn_capture_workers(
                 // Decoder state is worker-local; only actual IP fragments touch
                 // the shared sharded fragment cache. Normal packets stay lock-free.
                 let mut decoder = PacketDecoder::new(&cfg, metrics.clone(), fragments.clone());
+                let mut topology_observer = topology.local_observer();
                 let mut service_generation = 0u64;
                 let mut last_source_stats = SourceStats::default();
                 let mut last_stats_poll = Instant::now();
@@ -281,6 +285,14 @@ pub fn spawn_capture_workers(
                                 // selected interface deliver any frames at all?
                                 metrics.capture_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 metrics.capture_frame_bytes.fetch_add(frame.wire_len as u64, std::sync::atomic::Ordering::Relaxed);
+                                // Traffic topology intentionally observes the wire frame before
+                                // L4 parsing and the service allow-list. This keeps PPS/BPS honest
+                                // for fragmented, malformed or off-service IPv4 traffic.
+                                topology_observer.observe_ethernet_frame(
+                                    frame.ts_ns,
+                                    frame.wire_len,
+                                    &frame.data,
+                                );
 
                                 // Raw capture is a true forensic copy of every frame
                                 // delivered by the selected backend. Publish before
@@ -340,6 +352,7 @@ pub fn spawn_capture_workers(
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
+                    topology_observer.flush_if_due();
 
                 }
             })?);

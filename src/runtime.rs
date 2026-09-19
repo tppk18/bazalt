@@ -16,6 +16,7 @@ use crate::{
     metrics::Metrics,
     replay,
     storage::StorageRuntime,
+    topology::{ThrottleManager, TopologyTracker},
 };
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -47,6 +48,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     let healthy = Arc::new(AtomicBool::new(false));
     let maintenance = Arc::new(tokio::sync::RwLock::new(()));
     let auth = crate::auth::AuthManager::new(cfg.auth.clone());
+    let topology = TopologyTracker::new(
+        cfg.topology_group_prefix_v4,
+        cfg.topology_source_ttl,
+        cfg.topology_max_sources,
+    );
+    let throttle = ThrottleManager::new(cfg.throttle_interface.as_deref())?;
+    if let Some(interface) = cfg.throttle_interface.as_deref() {
+        tracing::info!(%interface, "IPv4 XDP traffic enforcement enabled");
+    } else {
+        tracing::info!("IPv4 traffic topology enabled; XDP enforcement disabled until BAZALT_THROTTLE_INTERFACE is set");
+    }
 
     let (live_events, _) = broadcast::channel(2048);
     let storage = StorageRuntime::start(cfg.clone(), metrics.clone(), live_events.clone()).await?;
@@ -109,6 +121,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             parking_lot::Mutex::new(std::collections::HashSet::new()),
         ),
         healthy: healthy.clone(),
+        topology: topology.clone(),
+        throttle: throttle.clone(),
     };
 
     let (api_shutdown_tx, api_shutdown_rx) = watch::channel(false);
@@ -121,6 +135,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         flow.input.clone(),
         metrics.clone(),
         services.clone(),
+        topology.clone(),
         shutdown.clone(),
     )?;
     tracing::info!(workers=capture.worker_count(), mode=?cfg.capture_mode, "capture runtime started");

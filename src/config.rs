@@ -115,6 +115,16 @@ pub struct Config {
     pub segment_max_record_bytes: usize,
     pub raw_capture_enabled: bool,
     pub raw_segment_dir: PathBuf,
+    /// Automatic IPv4 topology grouping prefix. /24 matches the usual A/D team subnet layout.
+    pub topology_group_prefix_v4: u8,
+    /// Remove silent source nodes from the live topology after this idle period.
+    pub topology_source_ttl: Duration,
+    /// Bound source-cardinality state so spoofed source floods cannot grow memory indefinitely.
+    pub topology_max_sources: usize,
+    /// Optional ingress interface where the XDP throttle program is attached.
+    /// In AF_XDP mode this must differ from the capture interface so enforcement cannot
+    /// replace or disrupt the XSK capture program.
+    pub throttle_interface: Option<String>,
     pub postgres_url: String,
     pub clickhouse_url: String,
     pub clickhouse_database: String,
@@ -263,6 +273,26 @@ impl Config {
                 "BAZALT_SEGMENT_STORE_MAX_BYTES must be at least BAZALT_SEGMENT_MAX_BYTES"
             );
         }
+        let topology_group_prefix_v4 = parse_env("PACKMATE_TOPOLOGY_GROUP_PREFIX_V4", 24u8)?;
+        if topology_group_prefix_v4 > 32 {
+            anyhow::bail!("BAZALT_TOPOLOGY_GROUP_PREFIX_V4 must be between 0 and 32");
+        }
+        let topology_source_ttl_secs = parse_env("PACKMATE_TOPOLOGY_SOURCE_TTL_SECS", 300u64)?;
+        if topology_source_ttl_secs == 0 {
+            anyhow::bail!("BAZALT_TOPOLOGY_SOURCE_TTL_SECS must be greater than zero");
+        }
+        let topology_max_sources = parse_env("PACKMATE_TOPOLOGY_MAX_SOURCES", 65_536usize)?;
+        if topology_max_sources == 0 {
+            anyhow::bail!("BAZALT_TOPOLOGY_MAX_SOURCES must be greater than zero");
+        }
+        let throttle_interface = env_value("PACKMATE_THROTTLE_INTERFACE");
+        if capture_mode == CaptureMode::AfXdp
+            && throttle_interface.as_deref() == Some(interface.as_str())
+        {
+            anyhow::bail!(
+                "BAZALT_THROTTLE_INTERFACE must differ from BAZALT_INTERFACE in AF_XDP mode; attach enforcement at the real ingress/forwarding point, not the capture XSK interface"
+            );
+        }
 
         Ok(Self {
             listen,
@@ -355,6 +385,10 @@ impl Config {
             segment_max_record_bytes,
             raw_capture_enabled: parse_bool_env("PACKMATE_RAW_CAPTURE", false)?,
             raw_segment_dir: PathBuf::from(env_or("PACKMATE_RAW_SEGMENT_DIR", "/data/raw")),
+            topology_group_prefix_v4,
+            topology_source_ttl: Duration::from_secs(topology_source_ttl_secs),
+            topology_max_sources,
+            throttle_interface,
             postgres_url: env_or(
                 "PACKMATE_POSTGRES_URL",
                 "postgres://packmate:packmate@127.0.0.1:65001/packmate",

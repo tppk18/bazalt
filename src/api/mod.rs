@@ -36,6 +36,7 @@ use crate::{
     storage::{
         clickhouse::ClickHouseStore, postgres::PostgresStore, segment::SegmentStore, MetadataSink,
     },
+    topology::{ThrottleManager, TopologyTracker},
 };
 
 #[derive(Clone)]
@@ -53,6 +54,8 @@ pub struct ApiState {
     pub live_events: broadcast::Sender<LiveEvent>,
     pub missing_segments_warned: Arc<Mutex<HashSet<String>>>,
     pub healthy: Arc<AtomicBool>,
+    pub topology: Arc<TopologyTracker>,
+    pub throttle: ThrottleManager,
 }
 
 pub async fn serve(
@@ -64,6 +67,11 @@ pub async fn serve(
         .route("/api/status", get(status))
         .route("/api/health", get(health))
         .route("/api/resources", get(resource_status))
+        .route("/api/topology", get(topology))
+        .route(
+            "/api/topology/throttle",
+            put(set_topology_throttle).delete(clear_topology_throttle),
+        )
         .route("/metrics", get(prometheus_metrics))
         .route("/api/flows", get(flows))
         .route("/api/flows/{id}", get(flow_detail))
@@ -330,6 +338,89 @@ async fn resource_status(State(s): State<ApiState>) -> Json<serde_json::Value> {
         "resources": crate::resources::snapshot(),
         "live_pressure_pct": s.metrics.live_pressure_pct(),
     }))
+}
+
+const DEFAULT_THROTTLE_TTL_SECS: u64 = 300;
+const MAX_THROTTLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Deserialize)]
+struct ThrottleRequest {
+    target: String,
+    drop_percent: u8,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ClearThrottleRequest {
+    target: String,
+}
+
+async fn topology(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "traffic": s.topology.snapshot(),
+        "enforcement": s.throttle.snapshot(),
+    }))
+}
+
+async fn set_topology_throttle(
+    State(s): State<ApiState>,
+    Json(req): Json<ThrottleRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !s.throttle.available() {
+        return Err(ApiError::service_unavailable(
+            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_INTERFACE to the ingress/forwarding interface",
+        ));
+    }
+    if !(1..=100).contains(&req.drop_percent) {
+        return Err(ApiError::bad_request("drop_percent must be between 1 and 100"));
+    }
+    let target = s
+        .topology
+        .canonical_throttle_target(&req.target)
+        .map_err(|message| ApiError::bad_request(&message))?;
+    let ttl_seconds = req.ttl_seconds.unwrap_or(DEFAULT_THROTTLE_TTL_SECS);
+    if ttl_seconds > MAX_THROTTLE_TTL_SECS {
+        return Err(ApiError::bad_request(
+            "ttl_seconds must be 0 (until disabled) or at most 604800 seconds",
+        ));
+    }
+    let rule = s
+        .throttle
+        .set_rule(&target, req.drop_percent, Some(ttl_seconds))
+        .map_err(ApiError::from)?;
+    tracing::warn!(
+        target=%target,
+        drop_percent=req.drop_percent,
+        ttl_seconds,
+        "traffic throttle rule changed"
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "rule": rule,
+        "enforcement": s.throttle.snapshot(),
+    })))
+}
+
+async fn clear_topology_throttle(
+    State(s): State<ApiState>,
+    Json(req): Json<ClearThrottleRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !s.throttle.available() {
+        return Err(ApiError::service_unavailable(
+            "XDP traffic enforcement is disabled; set BAZALT_THROTTLE_INTERFACE to the ingress/forwarding interface",
+        ));
+    }
+    let target = s
+        .topology
+        .canonical_throttle_target(&req.target)
+        .map_err(|message| ApiError::bad_request(&message))?;
+    let removed = s.throttle.clear_rule(&target).map_err(ApiError::from)?;
+    tracing::warn!(target=%target, removed, "traffic throttle rule cleared");
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "removed": removed,
+        "enforcement": s.throttle.snapshot(),
+    })))
 }
 
 async fn flows(
@@ -1041,6 +1132,12 @@ impl ApiError {
     fn conflict(m: &str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: m.into(),
+        }
+    }
+    fn service_unavailable(m: &str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: m.into(),
         }
     }

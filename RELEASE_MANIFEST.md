@@ -204,3 +204,14 @@ The startup log prints the selected adaptive plan.
 - bounded queues;
 - packet/payload logging disabled by default;
 - legacy `PACKMATE_*` environment aliases and existing `packmate` database namespace for volume compatibility.
+
+## Unreleased feature work: IPv4 traffic topology
+
+- Added automatic source-based IPv4 topology grouping (default `/24`) with per-source/per-group PPS, bit-rate and cumulative wire counters.
+- Topology source cardinality is bounded (`BAZALT_TOPOLOGY_MAX_SOURCES`, default 65536); spoofed-source overflow remains visible in aggregate counters instead of allocating unbounded state.
+- Topology API/UI output is independently bounded to the busiest 256 groups / 2048 source rows so a spoofed high-cardinality view cannot freeze the browser; aggregate accounting remains complete and truncation is explicit.
+- Topology observes Ethernet/VLAN IPv4 frames before service filtering and aggregates per capture worker before periodic merge to avoid a global packet-path lock.
+- Added protected `/api/topology` and XDP throttle control endpoints.
+- Added an optional XDP LPM-trie enforcement plane with `/24`/`/32` longest-prefix rules, probabilistic percentage drops, TTL, kernel-side seen/drop statistics and bounded in-memory audit history.
+- Added a `TOPOLOGY` operator view with group/member traffic share and throttle controls.
+- AF_XDP capture and throttle interfaces are intentionally forced apart to prevent accidental replacement of the capture XDP/XSK program.

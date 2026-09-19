@@ -112,3 +112,11 @@ A 24h soak test should show bounded RSS and bounded queue depth; replay must red
 Native Rust tests cover: IPv4/IPv6 out-of-order fragments, fragment overlap rejection, snaplen truncation, VLAN/tunnel flow identity, TCP 32-bit wraparound, conflicting OOO and bridging overlaps, ACK-before-OOO recovery, OOO-timeout/final-drain recovery, OOO-pressure recovery, tentative OOO FIN validation/payload conflict, off-sequence RST, same-ISN SYN retransmission, HEAD pipelining, CONNECT tunnel mode, conflicting/equal Content-Length, transfer-coding order, oversized fixed/chunked bodies and prefix-aware HTTP resynchronization after a TCP offset gap.
 
 Performance invariants checked statically before release: no fragment lock on the unfragmented branch, zero-copy in-order TCP when OOO state is empty, bounded compact copies only on OOO/fragment paths, incremental HTTP header/chunk scans, and no semantic body retention after configured body limits.
+
+## Topology / throttle regressions
+
+Unit coverage verifies automatic `/24` grouping, VLAN IPv4 source extraction and canonicalization of `/32`/CIDR throttle targets. The repository verification also checks that topology observation happens before service filtering and that AF_XDP capture cannot share the configured throttle interface.
+
+For an integration test on a Linux host, set `BAZALT_THROTTLE_INTERFACE` to a disposable veth ingress, generate a fixed-rate IPv4 stream, apply a 50% `/32` rule through `PUT /api/topology/throttle`, and compare transmitted/received packet counts with the rule's `seen_packets`/`dropped_packets`. Repeat with a `/24` rule and an overlapping `/32` rule to verify longest-prefix precedence. Never run the destructive drop test on a management interface.
+
+Topology QA also covers bounded source cardinality: set a small source cap in the unit fixture and verify additional source addresses are accounted in overflow rather than allocated in the source map. Separate unit cases verify that large topology snapshots cap returned groups/source rows while retaining full aggregate counters and original group/source cardinality.

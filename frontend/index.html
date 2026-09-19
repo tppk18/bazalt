@@ -26,6 +26,7 @@
     <div class="service-tabs" id="service-tabs"></div>
     <button class="navbar-icon" id="add-service" title="Add service">＋</button>
     <div class="navbar-spacer"></div>
+    <button class="btn nav-button topology-nav" id="open-topology" type="button" title="IPv4 source topology and traffic enforcement">TOPOLOGY</button>
     <button class="btn nav-button management-nav" id="open-management" type="button" title="Storage, retention and access management">MANAGE</button>
     <button class="resource-summary" id="resource-toggle" type="button" aria-expanded="false" aria-controls="resource-panel" title="Resource usage">
       <span class="resource-health-dot" id="resource-health-dot"></span>
@@ -89,6 +90,54 @@
     <div class="resource-section-title">CAPTURE HEALTH / PACKET CLASSIFICATION</div>
     <div class="resource-loss-grid" id="resource-loss"></div>
   </aside>
+
+  <section class="management-view topology-view hidden" id="topology-view">
+    <div class="management-head">
+      <div>
+        <h2>TRAFFIC TOPOLOGY</h2>
+        <p>Automatic IPv4 source grouping. Groups are derived from observed source addresses; no team list is required.</p>
+      </div>
+      <div class="management-actions">
+        <button class="btn btn-secondary btn-sm" id="topology-refresh" type="button">REFRESH</button>
+        <button class="btn btn-secondary btn-sm" id="topology-close" type="button">BACK</button>
+      </div>
+    </div>
+
+    <div class="management-grid topology-summary-grid">
+      <div class="management-card">
+        <span class="management-card-label">AUTO GROUPS</span>
+        <strong id="topology-group-count">--</strong>
+        <small id="topology-prefix">IPv4 source groups</small>
+      </div>
+      <div class="management-card">
+        <span class="management-card-label">ACTIVE SOURCES</span>
+        <strong id="topology-source-count">--</strong>
+        <small id="topology-source-ttl">--</small>
+      </div>
+      <div class="management-card">
+        <span class="management-card-label">OBSERVED RATE</span>
+        <strong id="topology-ingress-rate">--</strong>
+        <small id="topology-ingress-pps">--</small>
+      </div>
+      <div class="management-card" id="topology-enforcement-card">
+        <span class="management-card-label">XDP ENFORCEMENT</span>
+        <strong id="topology-enforcement">--</strong>
+        <small id="topology-enforcement-meta">--</small>
+      </div>
+    </div>
+
+    <div class="topology-enforcement-note" id="topology-enforcement-note"></div>
+    <div class="topology-enforcement-note warn hidden" id="topology-capacity-note"></div>
+    <div class="topology-enforcement-note warn hidden" id="topology-view-note"></div>
+    <div class="topology-groups" id="topology-groups">
+      <div class="topology-empty">Waiting for IPv4 traffic…</div>
+    </div>
+
+    <section class="management-section topology-audit-section">
+      <div class="management-section-head"><div><h3>RECENT ENFORCEMENT</h3><p>Bounded in-memory audit of throttle changes and TTL expiry.</p></div></div>
+      <div class="management-table-wrap"><table class="management-table"><thead><tr><th>TIME</th><th>ACTION</th><th>TARGET</th><th>DROP</th><th>TTL</th></tr></thead><tbody id="topology-audit-body"><tr><td colspan="5">No throttle actions yet.</td></tr></tbody></table></div>
+    </section>
+  </section>
 
   <section class="management-view hidden" id="management-view">
     <div class="management-head">
@@ -224,6 +273,22 @@
           <div class="form-row create-only"><label for="pattern-service">SERVICE</label><select id="pattern-service" name="service"><option value="">ANY</option></select></div>
         </div>
         <div class="modal-footer"><button type="button" class="btn btn-secondary" data-close="pattern-modal">CANCEL</button><button type="submit" class="btn btn-primary">SAVE</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="throttle-modal">
+    <div class="modal">
+      <div class="modal-header"><h5>TRAFFIC THROTTLE</h5><button class="modal-close" data-close="throttle-modal">×</button></div>
+      <form id="throttle-form">
+        <div class="modal-body">
+          <div class="throttle-target" id="throttle-target-label">--</div>
+          <input type="hidden" name="target" id="throttle-target">
+          <div class="form-row"><label>DROP</label><div class="throttle-percent"><input type="range" id="throttle-percent-range" min="1" max="100" value="25"><input type="number" name="drop_percent" id="throttle-percent" min="1" max="100" value="25" required><span>%</span></div></div>
+          <div class="form-row"><label>DURATION</label><select name="ttl_seconds" id="throttle-ttl"><option value="60">1 minute</option><option value="300" selected>5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option><option value="0">Until disabled</option></select></div>
+          <p class="throttle-warning">This is real ingress enforcement: matching IPv4 packets are probabilistically dropped by XDP at the configured percentage before the normal network stack.</p>
+        </div>
+        <div class="modal-footer"><button type="button" class="btn btn-danger hidden" id="throttle-disable">DISABLE</button><button type="button" class="btn btn-secondary" data-close="throttle-modal">CANCEL</button><button type="submit" class="btn btn-primary">APPLY</button></div>
       </form>
     </div>
   </div>

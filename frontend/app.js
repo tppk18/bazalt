@@ -15,7 +15,7 @@ const state = {
   ua: {mode:'contains', value:''},
   serviceEdit: null, patternEdit: null,
   lastCounters: null, lastResourceSample: null, status: null, resourceStatus: null, ws: null,
-  management: null, managementOpen: false,
+  management: null, managementOpen: false, topology: null, topologyOpen: false, topologyLoading: false,
 };
 
 function esc(v){return String(v ?? '').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
@@ -70,6 +70,7 @@ function fmtBytes(value){
   const digits=v>=100||i===0?0:v>=10?1:2;return `${v.toFixed(digits)} ${units[i]}`;
 }
 function fmtCount(value){const n=Math.max(0,Number(value)||0);if(n>=1e9)return `${(n/1e9).toFixed(1)}G`;if(n>=1e6)return `${(n/1e6).toFixed(1)}M`;if(n>=1e3)return `${(n/1e3).toFixed(1)}K`;return String(Math.round(n));}
+function fmtBitRate(value){const n=Math.max(0,Number(value)||0);const units=['bit/s','Kbit/s','Mbit/s','Gbit/s','Tbit/s'];let v=n,i=0;while(v>=1000&&i<units.length-1){v/=1000;i++;}const digits=v>=100||i===0?0:v>=10?1:2;return `${v.toFixed(digits)} ${units[i]}`;}
 function fmtDuration(seconds){let s=Math.max(0,Math.floor(Number(seconds)||0));const d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);if(d)return `${d}d ${h}h`;if(h)return `${h}h ${m}m`;if(m)return `${m}m ${s%60}s`;return `${s}s`;}
 function pct(value,total){return total>0?Math.max(0,(Number(value)||0)*100/Number(total)):0;}
 function severity(value,warn,danger){return value>=danger?'danger':value>=warn?'warn':'';}
@@ -274,6 +275,43 @@ $('#ua-form').addEventListener('submit',e=>{e.preventDefault();state.ua={mode:$(
 $('#clear-ua').addEventListener('click',()=>{state.ua={mode:'contains',value:''};hideModal('ua-modal');$('#ua-filter-btn').className='btn btn-sm btn-outline-secondary';loadFlows(true);});
 
 
+function ipv4ToInt(ip){const parts=String(ip||'').split('.').map(Number);if(parts.length!==4||parts.some(x=>!Number.isInteger(x)||x<0||x>255))return null;return (((parts[0]<<24)>>>0)|((parts[1]<<16)>>>0)|((parts[2]<<8)>>>0)|parts[3])>>>0;}
+function parseRuleTarget(target){const [raw,prefixRaw]=String(target||'').split('/');const value=ipv4ToInt(raw);if(value===null)return null;const prefix=prefixRaw===undefined?32:Number(prefixRaw);if(!Number.isInteger(prefix)||prefix<0||prefix>32)return null;const mask=prefix===0?0:(0xffffffff<<(32-prefix))>>>0;return {target:String(target),network:(value&mask)>>>0,prefix};}
+function effectiveTopologyRule(ip,rules){const value=ipv4ToInt(ip);if(value===null)return null;let best=null;for(const rule of rules||[]){const parsed=parseRuleTarget(rule.target);if(!parsed)continue;const mask=parsed.prefix===0?0:(0xffffffff<<(32-parsed.prefix))>>>0;if(((value&mask)>>>0)!==parsed.network)continue;if(!best||parsed.prefix>best.prefix)best={...parsed,rule};}return best?.rule||null;}
+function exactTopologyRule(target){return state.topology?.enforcement?.rules?.find(rule=>rule.target===target)||null;}
+function renderTopologyAudit(entries){const body=$('#topology-audit-body');if(!body)return;const rows=entries||[];body.innerHTML=rows.length?rows.map(entry=>`<tr><td>${esc(fmtTime(entry.at))}</td><td>${esc(String(entry.action||'').toUpperCase())}</td><td>${esc(entry.target||'-')}</td><td>${entry.drop_percent?`${esc(entry.drop_percent)}%`:'-'}</td><td>${entry.action==='set'?(entry.ttl_seconds?esc(fmtDuration(entry.ttl_seconds)):'UNTIL DISABLED'):'-'}</td></tr>`).join(''):'<tr><td colspan="5">No throttle actions yet.</td></tr>';}
+function ruleMeta(rule,sourceTarget=''){if(!rule)return '';const inherited=sourceTarget&&rule.target!==sourceTarget?` via ${rule.target}`:'';const expiry=rule.expires_at?` · until ${fmtTime(rule.expires_at)}`:' · until disabled';const dropped=Number(rule.dropped_packets||0)?` · ${fmtCount(rule.dropped_packets)} dropped`:'';return `${inherited}${expiry}${dropped}`;}
+function renderTopology(data){
+  state.topology=data;const t=data?.traffic||{};const e=data?.enforcement||{};const groups=t.groups||[];const rules=e.rules||[];
+  $('#topology-group-count').textContent=fmtCount(t.group_count||0);$('#topology-prefix').textContent=`automatic IPv4 /${t.group_prefix_v4??24} source groups`;
+  $('#topology-source-count').textContent=fmtCount(t.source_count||0);$('#topology-source-ttl').textContent=`hide after ${fmtDuration(t.source_ttl_seconds||0)} idle · cap ${fmtCount(t.source_capacity||0)}`;
+  const capacityNote=$('#topology-capacity-note');const saturated=Boolean(t.source_capacity_saturated);capacityNote.classList.toggle('hidden',!saturated);capacityNote.textContent=saturated?`Source tracking cap reached (${fmtCount(t.source_capacity||0)}). Overflow traffic is still counted in observed totals but cannot be grouped per source: ${fmtBitRate(t.untracked_bits_per_second||0)}, ${fmtCount(t.untracked_packets_per_second||0)} pkt/s.`:'';
+  const viewNote=$('#topology-view-note');const viewTruncated=Boolean(t.view_truncated);viewNote.classList.toggle('hidden',!viewTruncated);viewNote.textContent=viewTruncated?`Large topology: showing the busiest ${fmtCount(t.returned_group_count||0)} of ${fmtCount(t.group_count||0)} groups and ${fmtCount(t.returned_source_count||0)} of ${fmtCount(t.source_count||0)} tracked sources. Aggregate rates and totals still include all tracked traffic.`:'';
+  $('#topology-ingress-rate').textContent=fmtBitRate(t.bits_per_second||0);$('#topology-ingress-pps').textContent=`${fmtCount(t.packets_per_second||0)} packets/s · ${t.rate_window_seconds||5}s window`;
+  $('#topology-enforcement').textContent=e.available?'READY':'OFF';$('#topology-enforcement-meta').textContent=e.available?`${e.interface||'-'} · ${rules.length} active rule${rules.length===1?'':'s'}`:'set BAZALT_THROTTLE_INTERFACE';
+  const note=$('#topology-enforcement-note');note.className=`topology-enforcement-note ${e.available?'ok':'warn'}`;note.textContent=e.available?`Real XDP packet drop is armed on ${e.interface}. Throttle can be applied to a whole auto-discovered group or to one source IP.`:'Topology is active. Enforcement is intentionally disabled until BAZALT_THROTTLE_INTERFACE points at the real ingress/forwarding interface.';
+  renderTopologyAudit(e.audit||[]);
+  if(!groups.length){$('#topology-groups').innerHTML='<div class="topology-empty">Waiting for IPv4 source traffic…</div>';return;}
+  const totalBps=Math.max(1,Number(t.bits_per_second)||0);
+  $('#topology-groups').innerHTML=groups.map(group=>{
+    const groupShare=Math.min(100,Math.max(0,Number(group.bits_per_second||0)*100/totalBps));const groupRule=rules.find(rule=>rule.target===group.cidr);const groupMax=Math.max(1,Number(group.bits_per_second)||0);
+    const rows=(group.sources||[]).map(src=>{const rule=effectiveTopologyRule(src.ip,rules);const share=Math.min(100,Math.max(0,Number(src.bits_per_second||0)*100/groupMax));return `<tr><td><span class="topology-source-ip">${esc(src.ip)}</span></td><td class="topology-source-rate"><strong>${fmtBitRate(src.bits_per_second||0)}</strong><small>${fmtCount(src.packets_per_second||0)} pkt/s</small></td><td><div class="topology-source-bar" title="${share.toFixed(1)}% of group"><span style="width:${share}%"></span></div></td><td>${fmtBytes(src.bytes_total||0)}<br><small>${fmtCount(src.packets_total||0)} packets</small></td><td>${rule?`<span class="topology-throttle-state">DROP ${rule.drop_percent}%</span><span class="topology-rule-meta">${esc(ruleMeta(rule,src.ip))}</span>`:'<span class="topology-throttle-state off">NO THROTTLE</span>'}</td><td><button class="btn btn-sm ${rule?'btn-outline-warning':'btn-secondary'}" data-throttle-target="${esc(src.ip)}">THROTTLE</button></td></tr>`;}).join('');
+    const visibleSources=group.sources?.length||0;const totalSources=group.source_count??visibleSources;const sourceLabel=group.sources_truncated?`${fmtCount(totalSources)} sources · showing top ${fmtCount(visibleSources)}`:`${fmtCount(totalSources)} source${totalSources===1?'':'s'}`;
+    return `<section class="topology-group"><div class="topology-group-head"><div class="topology-group-title"><strong>${esc(group.cidr)}</strong><span>${sourceLabel} · ${groupShare.toFixed(1)}% of observed traffic</span></div><div class="topology-group-rate"><strong>${fmtBitRate(group.bits_per_second||0)}</strong><small>${fmtCount(group.packets_per_second||0)} pkt/s · ${fmtBytes(group.bytes_total||0)} total</small>${groupRule?`<span class="topology-rule-meta">DROP ${groupRule.drop_percent}%${esc(ruleMeta(groupRule))}</span>`:''}</div><button class="btn btn-sm ${groupRule?'btn-outline-warning':'btn-secondary'}" data-throttle-target="${esc(group.cidr)}">GROUP THROTTLE</button></div><div class="topology-share"><span style="width:${groupShare}%"></span></div><table class="topology-source-table"><thead><tr><th>SOURCE</th><th>LIVE RATE</th><th>GROUP SHARE</th><th>TOTAL OBSERVED</th><th>ENFORCEMENT</th><th>ACTION</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+  }).join('');
+  $$('[data-throttle-target]').forEach(button=>button.addEventListener('click',()=>openThrottle(button.dataset.throttleTarget)));
+}
+async function loadTopology(){if(state.topologyLoading)return;state.topologyLoading=true;try{renderTopology(await api('/api/topology'));}catch(e){if(e.message!=='authentication required')toast(`Failed to load topology: ${e.message}`);}finally{state.topologyLoading=false;}}
+function openTopology(){state.topologyOpen=true;if(state.managementOpen)closeManagement();$('#topology-view').classList.remove('hidden');$('#open-topology').classList.add('active');setResourceExpanded(false);loadTopology();}
+function closeTopology(){state.topologyOpen=false;$('#topology-view').classList.add('hidden');$('#open-topology').classList.remove('active');}
+function openThrottle(target){const enforcement=state.topology?.enforcement;if(!enforcement?.available){toast('XDP enforcement is disabled. Configure BAZALT_THROTTLE_INTERFACE first.');return;}const rule=exactTopologyRule(target);$('#throttle-target').value=target;$('#throttle-target-label').textContent=target;const percent=Number(rule?.drop_percent||25);$('#throttle-percent').value=percent;$('#throttle-percent-range').value=percent;$('#throttle-ttl').value='300';$('#throttle-disable').classList.toggle('hidden',!rule);showModal('throttle-modal');}
+$('#open-topology').addEventListener('click',()=>state.topologyOpen?closeTopology():openTopology());
+$('#topology-close').addEventListener('click',closeTopology);$('#topology-refresh').addEventListener('click',loadTopology);
+$('#throttle-percent-range').addEventListener('input',()=>{$('#throttle-percent').value=$('#throttle-percent-range').value;});$('#throttle-percent').addEventListener('input',()=>{$('#throttle-percent-range').value=Math.max(1,Math.min(100,Number($('#throttle-percent').value)||1));});
+$('#throttle-form').addEventListener('submit',async e=>{e.preventDefault();const target=$('#throttle-target').value;const drop_percent=Math.max(1,Math.min(100,Number($('#throttle-percent').value)||25));const ttl_seconds=Math.max(0,Number($('#throttle-ttl').value)||0);try{await api('/api/topology/throttle',{method:'PUT',body:JSON.stringify({target,drop_percent,ttl_seconds})});hideModal('throttle-modal');await loadTopology();toast(`Throttle ${drop_percent}% applied to ${target}.`,'success');}catch(err){toast(`Throttle failed: ${err.message}`);}});
+$('#throttle-disable').addEventListener('click',async()=>{const target=$('#throttle-target').value;try{await api('/api/topology/throttle',{method:'DELETE',body:JSON.stringify({target})});hideModal('throttle-modal');await loadTopology();toast(`Throttle disabled for ${target}.`,'success');}catch(err){toast(`Failed to disable throttle: ${err.message}`);}});
+
+
 function managementTableLabel(name){
   return ({flows:'Flows',http_messages:'HTTP messages',content_index:'Payload index',matches:'Pattern matches'})[name]||name;
 }
@@ -297,7 +335,7 @@ async function loadManagement(){
   try{const data=await api('/api/management/storage');renderManagement(data);}
   catch(e){if(e.message!=='authentication required')toast(`Failed to load management data: ${e.message}`);}
 }
-function openManagement(){state.managementOpen=true;$('#management-view').classList.remove('hidden');$('#open-management').classList.add('active');setResourceExpanded(false);loadManagement();updateRetentionPreview();}
+function openManagement(){state.managementOpen=true;if(state.topologyOpen)closeTopology();$('#management-view').classList.remove('hidden');$('#open-management').classList.add('active');setResourceExpanded(false);loadManagement();updateRetentionPreview();}
 function closeManagement(){state.managementOpen=false;$('#management-view').classList.add('hidden');$('#open-management').classList.remove('active');}
 function retentionSeconds(){return Math.floor(Math.max(1,Number($('#retention-value').value)||1)*Math.max(1,Number($('#retention-unit').value)||1));}
 function updateRetentionPreview(){const cutoff=new Date(Date.now()-retentionSeconds()*1000);$('#retention-preview').textContent=`Cutoff: ${cutoff.toLocaleString('ru-RU')} (${cutoff.toISOString()})`;}
@@ -384,6 +422,7 @@ async function bootApp(){
     intervalsStarted=true;
     setInterval(()=>{if($('#login-screen').classList.contains('hidden'))loadResources();},2000);
     setInterval(()=>{if($('#login-screen').classList.contains('hidden'))loadStatus();},5000);
+    setInterval(()=>{if($('#login-screen').classList.contains('hidden')&&state.topologyOpen)loadTopology();},1000);
     setInterval(async()=>{if($('#login-screen').classList.contains('hidden')&&!state.paused){await loadFlows(true);if(state.selectedFlow)await openFlow(state.selectedFlow);}},30000);
   }
 }

@@ -265,3 +265,13 @@ bazalt_replay_bytes_total
 - `docs/OPERATIONS.md` — production capture и диагностика;
 - `docs/TESTING.md` — unit/smoke/soak tests;
 - `VERIFYING.md` — какие проверки были выполнены для release artifact.
+
+## Traffic topology / throttling
+
+BAZALT now has a live IPv4 `TOPOLOGY` view. Team-like groups are inferred automatically from source addresses (default `/24`), so `10.10.1.x` and `10.10.2.x` naturally become separate groups without a roster/config file. Each group expands to the individual sources with PPS, bit rate, cumulative traffic and relative share.
+
+Topology counts wire IPv4 frames before the service allow-list, which keeps packet-spam visible even when it targets an unconfigured port. Capture workers aggregate locally and merge every ~250 ms instead of locking shared state per packet.
+
+Optional enforcement uses real XDP packet drops. Configure `BAZALT_THROTTLE_INTERFACE` to the ingress/forwarding interface, then the UI can apply a percentage drop to one source (`/32`) or the whole auto-discovered group (`/24`) with a TTL. In AF_XDP mode this interface must be different from `BAZALT_INTERFACE` to keep passive capture and enforcement failure domains separate.
+
+Topology source state is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES` (default `65536`); traffic above the cardinality cap is still included in aggregate observed counters and is exposed as untracked overflow.

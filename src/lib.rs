@@ -14,3 +14,4 @@ pub mod replay;
 pub mod resources;
 pub mod runtime;
 pub mod storage;
+pub mod topology;

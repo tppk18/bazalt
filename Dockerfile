@@ -8,7 +8,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY Cargo.toml build.rs rust-toolchain.toml ./
+COPY Cargo.toml build.rs rust-toolchain.toml VERSION ./
 COPY native ./native
 COPY src ./src
 COPY frontend ./frontend
@@ -44,6 +44,6 @@ ENV BAZALT_LISTEN=0.0.0.0:65000 \
 
 EXPOSE 65000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
-    CMD-SHELL curl -fsS -u "$BAZALT_AUTH_USERNAME:$BAZALT_AUTH_PASSWORD" http://127.0.0.1:65000/api/health >/dev/null || exit 1
+    CMD curl -fsS -u "$BAZALT_AUTH_USERNAME:$BAZALT_AUTH_PASSWORD" http://127.0.0.1:65000/api/health >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/bin/bazalt"]

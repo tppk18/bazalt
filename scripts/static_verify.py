@@ -84,7 +84,7 @@ assert "exceeds remaining file payload bytes" in segment
 assert 'parse_env("PACKMATE_MAX_ACTIVE_FLOWS", 262_144usize)' in text("src/config.rs")
 http_source = text("src/http/mod.rs")
 test_cfg = http_source.split("fn test_cfg() -> Config", 1)[1]
-for field in ("max_active_flows:", "matcher_max_hits_per_pattern:", "matcher_max_hits_per_record:", "segment_max_record_bytes:"):
+for field in ("max_active_flows:", "matcher_max_hits_per_pattern:", "matcher_max_hits_per_record:", "segment_max_record_bytes:", "topology_max_sources:"):
     assert field in test_cfg, f"Config test literal missing {field}"
 assert "try_admit_flow" in flow and "flow_state_rejections" in flow
 assert "scan_bounded" in matching and "max_hits_per_pattern" in matching and "max_hits_per_record" in matching
@@ -179,12 +179,43 @@ assert "sched_getaffinity" in text("src/affinity.rs") and "requested % allowed.l
 # Service CRUD and pattern revisions remain persisted.
 api = text("src/api/mod.rs")
 pg = text("src/storage/postgres.rs")
-assert '.route("/api/services/{port}", put(update_service).delete(delete_service))' in api
+assert re.search(
+    r'\.route\(\s*"/api/services/\{port\}"\s*,\s*put\(update_service\)\.delete\(delete_service\)\s*,?\s*\)',
+    api,
+), "service update/delete route missing"
 assert "StatusCode::CREATED" in api and "upsert_service" in api
 assert "http BOOLEAN NOT NULL DEFAULT TRUE" in pg
 assert "urldecode_http_requests" in pg and "merge_adjacent_packets" in pg and "parse_websockets" in pg
 assert 'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)' in pg
 assert "WHERE enabled = TRUE" in pg and ") latest" in pg
+
+# IPv4 topology and real XDP traffic enforcement invariants.
+topology = text("src/topology.rs")
+capture = text("src/capture/mod.rs")
+assert "pub struct TopologyTracker" in topology and "LocalTopologyObserver" in topology
+assert "BAZALT_TOPOLOGY_GROUP_PREFIX_V4" in text(".env.example")
+assert 'parse_env("PACKMATE_TOPOLOGY_GROUP_PREFIX_V4", 24u8)' in config
+assert 'parse_env("PACKMATE_TOPOLOGY_MAX_SOURCES", 65_536usize)' in config
+assert "source_capacity_saturated" in topology and "untracked_bits_per_second" in topology
+assert "MAX_SNAPSHOT_GROUPS: usize = 256" in topology and "MAX_SNAPSHOT_SOURCES: usize = 2_048" in topology
+assert "view_truncated" in topology and "returned_source_count" in topology
+assert "canonical_throttle_target" in topology and "broader than automatic topology group" in topology
+assert "operations: Mutex<()>" in topology and "prune_expired_locked" in topology
+assert "observe_ethernet_frame" in capture
+assert capture.index("observe_ethernet_frame") < capture.index("decoder.decode(frame)"), "topology must observe wire IPv4 before the main decoder/service filter"
+assert '.route("/api/topology", get(topology))' in api
+assert '"/api/topology/throttle"' in api and "set_topology_throttle" in api and "clear_topology_throttle" in api
+assert "BAZALT_THROTTLE_INTERFACE" in text(".env.example")
+assert "throttle_interface.as_deref() == Some(interface.as_str())" in config
+assert "BPF_MAP_TYPE_LPM_TRIE" in text("native/throttle.bpf.c")
+assert "XDP_DROP" in text("native/throttle.bpf.c") and "bpf_get_prandom_u32" in text("native/throttle.bpf.c")
+assert "bpf_program__attach_xdp" in text("native/throttle.c")
+assert "BAZALT_THROTTLE_BPF_OBJECT" in text("build.rs")
+topology_html = text("frontend/index.html")
+topology_js = text("frontend/app.js")
+assert 'id="topology-view"' in topology_html and 'id="throttle-modal"' in topology_html
+assert "effectiveTopologyRule" in topology_js and "data-throttle-target" in topology_js
+assert 'id="topology-view-note"' in topology_html and "view_truncated" in topology_js
 
 # ClickHouse 25.8 alias regression.
 ch = text("src/storage/clickhouse.rs")
@@ -249,8 +280,11 @@ assert "bridge_current" in matching and "Scan the current chunk directly" in mat
 assert "TailState" in matching and "end_offset == record.stream_offset" in matching
 assert "flow_tail_keys" in matching and "tails.retain" not in matching
 assert "interest_mask" in matching and "content_view_bit" in matching
-assert "is_interested_view" in matching and "matcher_tx.is_interested_view(record.view)" in http
-assert '"live matcher stopped"' in http and '"content segment writer stopped"' in http
+assert "is_interested_view" in matching and re.search(
+    r"matcher_tx\s*\.is_interested_view\(record\.view\)", http
+)
+assert "matcher_tx.try_send(MatchInput::Content(record))" in http
+assert '"content segment writer stopped"' in http
 assert "semantic_tail_is_not_reused_across_stream_offset_gap" in matching
 assert "BytesMut" in http and "httparse::Request" in http and "HashMap::<String,String>" not in http
 assert "buffer.drain" not in http and "body_record(&info, self.stream_offset, data.clone())" not in http

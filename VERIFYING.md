@@ -103,3 +103,42 @@ python3 scripts/verify_v04_hotpath.py
 ```
 
 This separately checks that normal in-order/unfragmented traffic does not enter fragment/OOO slow paths, that global flow admission does not add synchronization to existing-flow packets, and that match-amplification bounds remain on the positive-match slow path.
+
+## Unreleased IPv4 topology / XDP throttle verification
+
+The traffic-topology feature adds an always-on IPv4 source observer and an optional XDP enforcement plane. The implementation is intentionally split so topology does not require an enforcement interface and no packet is dropped unless `BAZALT_THROTTLE_INTERFACE` is explicitly configured.
+
+Checks completed in the artifact environment after the feature implementation:
+
+```text
+python3 scripts/static_verify.py                    PASS
+python3 scripts/verify_fixture.py                   PASS
+python3 scripts/verify_v04_hotpath.py               PASS
+python3 -m py_compile scripts/*.py                  PASS
+node --check frontend/app.js                        PASS
+bash -n scripts/smoke.sh                            PASS
+bash -n scripts/verify_source.sh                    PASS
+docker-compose.yml YAML parse                       PASS
+clang -Wall -Wextra -Werror -fsyntax-only
+  native/throttle.bpf.c                             PASS (host C syntax)
+```
+
+Topology-specific invariants covered by source/unit checks:
+
+- source IPv4 is observed from the Ethernet/VLAN frame before L4 decode and before the service-port allow-list;
+- capture workers aggregate source counters locally and merge periodically rather than taking a global lock per packet;
+- automatic grouping defaults to source `/24`, while individual `/32` members remain visible and independently throttleable;
+- the per-source table is bounded by `BAZALT_TOPOLOGY_MAX_SOURCES`; cardinality overflow remains included in aggregate counters instead of allocating unbounded source state;
+- API/UI snapshots are independently capped to the busiest 256 groups / 2048 source rows while keeping full tracked aggregate counters and explicit truncation metadata;
+- topology snapshot grouping/sorting happens after the shared state lock is released, reducing interference with capture-worker merges;
+- stale source entries are garbage-collected independently of whether the Topology UI is open;
+- throttle targets are canonicalized and XDP uses an LPM trie, so overlapping group/source rules resolve by longest prefix;
+- throttle targets broader than the configured automatic group prefix are rejected to prevent accidental wide-area penalties;
+- control-plane `set`/`clear`/TTL-expiry operations are serialized across the kernel map and in-memory rulebook to prevent stale-expiry races from deleting replacement rules;
+- percentage drops are probabilistic per packet and support finite TTL or explicit manual disable;
+- AF_XDP capture and XDP enforcement cannot be configured on the same interface;
+- throttle changes and expiry are retained in a bounded in-memory audit ring.
+
+Native Rust compile/clippy/test execution is still not possible in this artifact environment because no Rust toolchain is installed. `./scripts/verify_source.sh` therefore correctly stops at the mandatory cargo gate instead of claiming a native build. The available clang is a Swift clang build without the BPF backend (`-target bpf` is unavailable), so the actual eBPF target compile/load must be validated by the Docker release gate or a Linux host with Debian/LLVM clang and libbpf/libxdp development headers. The Docker builder installs those dependencies and `cargo test/build --all-features` invokes the BPF compile through `build.rs`.
+
+A destructive enforcement acceptance test should be run only on a disposable veth/test ingress: apply 25/50/100% `/32` and `/24` rules, verify kernel seen/drop counters, TTL expiry, overlapping `/24` + `/32` precedence, and confirm the management/capture interface is unaffected.
